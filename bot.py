@@ -17,11 +17,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9247740629:AAE96VCZow9OgTf
 TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
-# Wazzup используется только при обращении «Помощь» (если настроен канал)
-WAZZUP_API_KEY = os.getenv("WAZZUP_API_KEY", "60b72896d7c6490595a9f9f213a9b8ed").strip()
-WAZZUP_CHANNEL_ID = os.getenv("WAZZUP_CHANNEL_ID", "1213b290-ce0e-4ff8-abd2-31dcd5956aee").strip()
-WAZZUP_API_BASE = "https://api.wazzup24.com/v3"
-
 # Основной парк (Яндекс Fleet API)
 PARKS_CONFIG: list[dict[str, str]] = [
     {
@@ -42,7 +37,6 @@ AMOCRM_PIPELINE_ID = int(os.getenv("AMOCRM_PIPELINE_ID", "10053610"))
 AMOCRM_STATUS_ID = int(os.getenv("AMOCRM_STATUS_ID", "79731826"))
 AMOCRM_CLOSED_LOST_ID = int(os.getenv("AMOCRM_CLOSED_LOST_ID", "143"))
 
-# При необходимости можно жёстко указать ID конкретных кастомных полей amoCRM
 AMOCRM_FIELD_IDS: dict[str, int | None] = {
     "lead_telegram": None,
     "lead_city": None,
@@ -492,39 +486,6 @@ async def delayed_notifications_worker() -> None:
         await asyncio.sleep(5)
 
 
-# ================= WAZZUP =================
-async def send_help_via_wazzup(chat_id: int | str, text: str) -> bool:
-    if not WAZZUP_API_KEY or not WAZZUP_CHANNEL_ID:
-        return False
-    payload = {
-        "channelId": WAZZUP_CHANNEL_ID,
-        "chatType": "telegram",
-        "chatId": str(chat_id),
-        "text": text,
-        "crmMessageId": str(uuid.uuid4()),
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{WAZZUP_API_BASE}/message",
-                headers={
-                    "Authorization": f"Bearer {WAZZUP_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=20,
-            ) as resp:
-                resp_text = await resp.text()
-                if resp.status in (200, 201):
-                    logger.info("Wazzup [Помощь] отправлено (%s) -> chatId=%s: %s", resp.status, chat_id, resp_text[:200])
-                    return True
-                logger.warning("Wazzup [Помощь] вернул (%s): %s", resp.status, resp_text[:300])
-                return False
-    except Exception as exc:
-        logger.warning("Ошибка отправки в Wazzup по кнопке Помощь: %s", exc)
-        return False
-
-
 # ================= AMOCRM (АВТОЗАПОЛНЕНИЕ ГРАФ СДЕЛКИ И КОНТАКТА) =================
 def _amocrm_headers() -> dict[str, str]:
     return {
@@ -772,7 +733,7 @@ async def send_lead_to_amocrm(
             f"Telegram: {tg_login}",
             f"Ссылка на чат: {tg_link}",
             f"Telegram ID: {chat_id}",
-            f"Ответ курьеру из бота: /reply {chat_id} <текст>",
+            f"Ответить курьеру: /reply {chat_id} <текст>",
         ]
 
         try:
@@ -904,7 +865,7 @@ async def send_help_to_amocrm(
             f"Telegram: {tg_login}\n"
             f"Ссылка на чат: {tg_link}\n"
             f"Telegram ID: {chat_id}\n"
-            f"Ответить курьеру из бота: /reply {chat_id} <текст>\n"
+            f"Ответить курьеру: /reply {chat_id} <текст>\n"
             f"Текст проблемы:\n{problem_text.strip()}"
         )
 
@@ -1525,7 +1486,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "help_waiting_problem", {"prev_step": prev_step, "prev_data": prev_data})
         await tg_send_text(
             chat_id,
-            "Добрый день! Опишите Вашу проблему — мы передадим её в amoCRM и ответим вам.",
+            "Добрый день! Опишите Вашу проблему — мы передадим её в amoCRM и ответим вам здесь.",
             reply_markup=kb_step_with_help(),
         )
         return
@@ -1558,10 +1519,6 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             chat_id=chat_id,
             tg_username=tg_username,
             full_name=contact_name,
-        )
-        await send_help_via_wazzup(
-            chat_id=chat_id,
-            text=f"Обращение от {contact_name} ({format_tg_login(chat_id, tg_username)}):\n{problem_body}",
         )
         await tg_send_text(
             chat_id,
