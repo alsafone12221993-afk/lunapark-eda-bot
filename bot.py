@@ -13,7 +13,7 @@ import aiohttp
 from aiohttp import web
 
 # ================= КОНФИГУРАЦИЯ =================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9247740629:AAG9pvz304fqYA_3kLsG79oSA-k2mY7aYCw").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9247740629:AAEhQGgIKlpgtVy2oQMpVFBhIRNdxn2uPgI").strip()
 TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
