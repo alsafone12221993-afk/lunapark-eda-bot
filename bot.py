@@ -17,7 +17,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9247740629:AAE96VCZow9OgTf
 TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
-# Wazzup используется ТОЛЬКО для обращения «Помощь», чтобы менеджер мог ответить
+# Wazzup используется только при обращении «Помощь» (если настроен канал)
 WAZZUP_API_KEY = os.getenv("WAZZUP_API_KEY", "60b72896d7c6490595a9f9f213a9b8ed").strip()
 WAZZUP_CHANNEL_ID = os.getenv("WAZZUP_CHANNEL_ID", "1213b290-ce0e-4ff8-abd2-31dcd5956aee").strip()
 WAZZUP_API_BASE = "https://api.wazzup24.com/v3"
@@ -41,7 +41,18 @@ AMOCRM_ACCESS_TOKEN = os.getenv(
 AMOCRM_PIPELINE_ID = int(os.getenv("AMOCRM_PIPELINE_ID", "10053610"))
 AMOCRM_STATUS_ID = int(os.getenv("AMOCRM_STATUS_ID", "79731826"))
 AMOCRM_CLOSED_LOST_ID = int(os.getenv("AMOCRM_CLOSED_LOST_ID", "143"))
-AMOCRM_TELEGRAM_FIELD_ID: int | None = None
+
+# При необходимости можно жёстко указать ID конкретных кастомных полей amoCRM
+AMOCRM_FIELD_IDS: dict[str, int | None] = {
+    "lead_telegram": None,
+    "lead_city": None,
+    "lead_transport": None,
+    "lead_phone": None,
+    "lead_problem": None,
+    "contact_telegram": None,
+    "contact_city": None,
+    "contact_transport": None,
+}
 
 USERS_FILE = "users_db.json"
 APPS_FILE = "applications.json"
@@ -65,7 +76,7 @@ DRIVER_STATS_CACHE: dict[str, dict[str, Any]] = {}
 DRIVER_STATS_TTL_SEC = 180
 
 PENDING_PROFILES: dict[str, list[dict[str, Any]]] = {}
-_DETECTED_TG_FIELD_CACHE: dict[str, int | None] = {}
+_FIELDS_CATALOG_CACHE: dict[str, list[dict[str, Any]]] = {}
 _FILE_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 _STATS_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -481,7 +492,7 @@ async def delayed_notifications_worker() -> None:
         await asyncio.sleep(5)
 
 
-# ================= WAZZUP (ТОЛЬКО ДЛЯ «ПОМОЩИ», ЧТОБЫ МОЖНО БЫЛО ОТВЕТИТЬ) =================
+# ================= WAZZUP =================
 async def send_help_via_wazzup(chat_id: int | str, text: str) -> bool:
     if not WAZZUP_API_KEY or not WAZZUP_CHANNEL_ID:
         return False
@@ -505,7 +516,7 @@ async def send_help_via_wazzup(chat_id: int | str, text: str) -> bool:
             ) as resp:
                 resp_text = await resp.text()
                 if resp.status in (200, 201):
-                    logger.info("Wazzup [Помощь] отправлено (%s) -> chatId=%s", resp.status, chat_id)
+                    logger.info("Wazzup [Помощь] отправлено (%s) -> chatId=%s: %s", resp.status, chat_id, resp_text[:200])
                     return True
                 logger.warning("Wazzup [Помощь] вернул (%s): %s", resp.status, resp_text[:300])
                 return False
@@ -514,7 +525,7 @@ async def send_help_via_wazzup(chat_id: int | str, text: str) -> bool:
         return False
 
 
-# ================= AMOCRM =================
+# ================= AMOCRM (АВТОЗАПОЛНЕНИЕ ГРАФ СДЕЛКИ И КОНТАКТА) =================
 def _amocrm_headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {AMOCRM_ACCESS_TOKEN}",
@@ -522,43 +533,98 @@ def _amocrm_headers() -> dict[str, str]:
     }
 
 
-async def _detect_tg_custom_field_id(
+async def _get_custom_fields_catalog(
     session: aiohttp.ClientSession,
     base_url: str,
     entity_type: str,
-) -> int | None:
-    if AMOCRM_TELEGRAM_FIELD_ID:
-        return AMOCRM_TELEGRAM_FIELD_ID
-    if entity_type in _DETECTED_TG_FIELD_CACHE:
-        return _DETECTED_TG_FIELD_CACHE[entity_type]
+) -> list[dict[str, Any]]:
+    if entity_type in _FIELDS_CATALOG_CACHE:
+        return _FIELDS_CATALOG_CACHE[entity_type]
     try:
         async with session.get(
             f"{base_url}/api/v4/{entity_type}/custom_fields",
             headers=_amocrm_headers(),
             timeout=15,
         ) as resp:
-            if resp.status != 200:
-                _DETECTED_TG_FIELD_CACHE[entity_type] = None
-                return None
-            data = await resp.json()
-            for f_item in data.get("_embedded", {}).get("custom_fields", []):
-                fname = (f_item.get("name") or "").lower().strip()
-                if fname in (
-                    "telegram",
-                    "телеграм",
-                    "тг",
-                    "tg",
-                    "аккаунт telegram",
-                    "telegram аккаунт",
-                    "логин telegram",
-                ):
-                    fid = int(f_item["id"])
-                    _DETECTED_TG_FIELD_CACHE[entity_type] = fid
-                    return fid
+            if resp.status == 200:
+                data = await resp.json()
+                fields = data.get("_embedded", {}).get("custom_fields", []) or []
+                _FIELDS_CATALOG_CACHE[entity_type] = fields
+                return fields
     except Exception as exc:
-        logger.warning("Не удалось определить поле Telegram для %s: %s", entity_type, exc)
-    _DETECTED_TG_FIELD_CACHE[entity_type] = None
+        logger.warning("Не удалось загрузить поля %s из amoCRM: %s", entity_type, exc)
+    _FIELDS_CATALOG_CACHE[entity_type] = []
+    return []
+
+
+def _find_field_def(
+    fields: list[dict[str, Any]],
+    explicit_id: int | None,
+    keywords: tuple[str, ...],
+) -> dict[str, Any] | None:
+    if explicit_id:
+        for f in fields:
+            if int(f.get("id", 0)) == int(explicit_id):
+                return f
+        return {"id": int(explicit_id), "type": "text", "enums": []}
+
+    for f in fields:
+        fname = (f.get("name") or "").lower().strip()
+        if any(k in fname for k in keywords):
+            return f
     return None
+
+
+def _build_field_value_item(field_def: dict[str, Any], raw_value: str) -> dict[str, Any] | None:
+    val = (raw_value or "").strip()
+    if not val:
+        return None
+    fid = int(field_def["id"])
+    ftype = (field_def.get("type") or "text").lower()
+    enums = field_def.get("enums") or []
+
+    if ftype in ("select", "multiselect", "radiobutton"):
+        clean_target = normalize_choice_text(val)
+        matched_enum_id = None
+        for en in enums:
+            eval_str = str(en.get("value") or "")
+            if eval_str.lower().strip() == val.lower() or normalize_choice_text(eval_str) == clean_target:
+                matched_enum_id = en.get("id")
+                break
+        if matched_enum_id is None and clean_target:
+            for en in enums:
+                eval_clean = normalize_choice_text(str(en.get("value") or ""))
+                if clean_target in eval_clean or eval_clean in clean_target:
+                    matched_enum_id = en.get("id")
+                    break
+        if matched_enum_id is not None:
+            return {"field_id": fid, "values": [{"enum_id": int(matched_enum_id)}]}
+        if ftype == "select":
+            return None
+
+    return {"field_id": fid, "values": [{"value": val}]}
+
+
+def _build_custom_fields_values(
+    fields: list[dict[str, Any]],
+    mappings: list[tuple[int | None, tuple[str, ...], str]],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    used_ids: set[int] = set()
+    for explicit_id, keywords, val in mappings:
+        if not val:
+            continue
+        fdef = _find_field_def(fields, explicit_id, keywords)
+        if not fdef:
+            continue
+        fid = int(fdef["id"])
+        if fid in used_ids:
+            continue
+        item = _build_field_value_item(fdef, val)
+        if item:
+            used_ids.add(fid)
+            result.append(item)
+    return result
 
 
 async def _add_amocrm_note(
@@ -706,20 +772,44 @@ async def send_lead_to_amocrm(
             f"Telegram: {tg_login}",
             f"Ссылка на чат: {tg_link}",
             f"Telegram ID: {chat_id}",
+            f"Ответ курьеру из бота: /reply {chat_id} <текст>",
         ]
 
         try:
             async with aiohttp.ClientSession() as session:
-                contact_tg_fid = await _detect_tg_custom_field_id(session, base_url, "contacts")
-                lead_tg_fid = await _detect_tg_custom_field_id(session, base_url, "leads")
+                lead_fields_cat = await _get_custom_fields_catalog(session, base_url, "leads")
+                contact_fields_cat = await _get_custom_fields_catalog(session, base_url, "contacts")
+
+                lead_cf_values = _build_custom_fields_values(
+                    lead_fields_cat,
+                    [
+                        (AMOCRM_FIELD_IDS["lead_telegram"], ("telegram", "телеграм", "тг", "tg", "аккаунт", "логин"), tg_login),
+                        (AMOCRM_FIELD_IDS["lead_city"], ("город", "city", "регион"), lead.get("city", "")),
+                        (AMOCRM_FIELD_IDS["lead_transport"], ("транспорт", "формат", "доставк", "авто", "категор"), lead.get("transport", "")),
+                        (AMOCRM_FIELD_IDS["lead_phone"], ("телефон", "phone", "номер"), phone),
+                        (None, ("chat_id", "tg id", "telegram id", "id чата"), chat_id),
+                        (None, ("ссылка", "профиль", "чат"), tg_link),
+                    ],
+                )
+
+                contact_cf_values: list[dict[str, Any]] = [
+                    {"field_code": "PHONE", "values": [{"value": phone, "enum_code": "MOB"}]}
+                ]
+                extra_contact_cf = _build_custom_fields_values(
+                    contact_fields_cat,
+                    [
+                        (AMOCRM_FIELD_IDS["contact_telegram"], ("telegram", "телеграм", "тг", "tg", "аккаунт", "логин"), tg_login),
+                        (AMOCRM_FIELD_IDS["contact_city"], ("город", "city", "регион"), lead.get("city", "")),
+                        (AMOCRM_FIELD_IDS["contact_transport"], ("транспорт", "формат", "доставк", "авто"), lead.get("transport", "")),
+                    ],
+                )
+                contact_cf_values.extend(extra_contact_cf)
 
                 existing_lead_id = await _find_existing_client_lead(session, base_url, chat_id, phone)
                 if existing_lead_id:
                     patch_obj: dict[str, Any] = {"name": lead_title}
-                    if lead_tg_fid:
-                        patch_obj["custom_fields_values"] = [
-                            {"field_id": lead_tg_fid, "values": [{"value": tg_login}]}
-                        ]
+                    if lead_cf_values:
+                        patch_obj["custom_fields_values"] = lead_cf_values
                     async with session.patch(
                         f"{base_url}/api/v4/leads/{existing_lead_id}",
                         headers=_amocrm_headers(),
@@ -737,39 +827,27 @@ async def send_lead_to_amocrm(
                     await _add_amocrm_note(session, base_url, existing_lead_id, "\n".join(note_lines))
                     return True, f"обновлена сделка #{existing_lead_id}"
 
-                contact_fields: list[dict[str, Any]] = [
-                    {"field_code": "PHONE", "values": [{"value": phone, "enum_code": "MOB"}]}
-                ]
-                if contact_tg_fid:
-                    contact_fields.append({"field_id": contact_tg_fid, "values": [{"value": tg_login}]})
-
                 lead_obj: dict[str, Any] = {"name": lead_title}
                 if AMOCRM_PIPELINE_ID:
                     lead_obj["pipeline_id"] = AMOCRM_PIPELINE_ID
                 if AMOCRM_STATUS_ID:
                     lead_obj["status_id"] = AMOCRM_STATUS_ID
-                if lead_tg_fid:
-                    lead_obj["custom_fields_values"] = [
-                        {"field_id": lead_tg_fid, "values": [{"value": tg_login}]}
-                    ]
+                if lead_cf_values:
+                    lead_obj["custom_fields_values"] = lead_cf_values
 
                 payload = [
                     {
                         **lead_obj,
                         "_embedded": {
                             "contacts": [
-                                {"first_name": lead["name"], "custom_fields_values": contact_fields}
+                                {"first_name": lead["name"], "custom_fields_values": contact_cf_values}
                             ]
                         },
                     }
                 ]
 
-                async with session.post(
-                    f"{base_url}/api/v4/leads/complex",
-                    headers=_amocrm_headers(),
-                    json=payload,
-                    timeout=20,
-                ) as resp:
+                url = f"{base_url}/api/v4/leads/complex"
+                async with session.post(url, headers=_amocrm_headers(), json=payload, timeout=20) as resp:
                     resp_text = await resp.text()
                     if resp.status not in (200, 201, 202):
                         return False, f"HTTP {resp.status}: {resp_text[:250]}"
@@ -817,6 +895,7 @@ async def send_help_to_amocrm(
         safe_name = (full_name or "Пользователь").strip()
         user_rec = get_user_record(chat_id)
         phone = user_rec.get("phone", "")
+        city = user_rec.get("city", "")
 
         note_text = (
             "Парк: ЛунапаркЕда\n"
@@ -825,49 +904,65 @@ async def send_help_to_amocrm(
             f"Telegram: {tg_login}\n"
             f"Ссылка на чат: {tg_link}\n"
             f"Telegram ID: {chat_id}\n"
+            f"Ответить курьеру из бота: /reply {chat_id} <текст>\n"
             f"Текст проблемы:\n{problem_text.strip()}"
         )
 
         try:
             async with aiohttp.ClientSession() as session:
-                contact_tg_fid = await _detect_tg_custom_field_id(session, base_url, "contacts")
-                lead_tg_fid = await _detect_tg_custom_field_id(session, base_url, "leads")
+                lead_fields_cat = await _get_custom_fields_catalog(session, base_url, "leads")
+                contact_fields_cat = await _get_custom_fields_catalog(session, base_url, "contacts")
+
+                lead_cf_values = _build_custom_fields_values(
+                    lead_fields_cat,
+                    [
+                        (AMOCRM_FIELD_IDS["lead_telegram"], ("telegram", "телеграм", "тг", "tg", "аккаунт", "логин"), tg_login),
+                        (AMOCRM_FIELD_IDS["lead_city"], ("город", "city", "регион"), city),
+                        (AMOCRM_FIELD_IDS["lead_phone"], ("телефон", "phone", "номер"), phone),
+                        (AMOCRM_FIELD_IDS["lead_problem"], ("проблем", "обращен", "вопрос", "сообщен", "причин"), problem_text.strip()),
+                        (None, ("chat_id", "tg id", "telegram id", "id чата"), str(chat_id)),
+                        (None, ("ссылка", "профиль", "чат"), tg_link),
+                    ],
+                )
+
+                contact_cf_values: list[dict[str, Any]] = []
+                if phone:
+                    contact_cf_values.append({"field_code": "PHONE", "values": [{"value": phone, "enum_code": "MOB"}]})
+                extra_contact_cf = _build_custom_fields_values(
+                    contact_fields_cat,
+                    [
+                        (AMOCRM_FIELD_IDS["contact_telegram"], ("telegram", "телеграм", "тг", "tg", "аккаунт", "логин"), tg_login),
+                        (AMOCRM_FIELD_IDS["contact_city"], ("город", "city", "регион"), city),
+                    ],
+                )
+                contact_cf_values.extend(extra_contact_cf)
 
                 existing_lead_id = await _find_existing_client_lead(session, base_url, chat_id, phone)
                 if existing_lead_id:
-                    if lead_tg_fid:
+                    patch_obj: dict[str, Any] = {}
+                    if lead_cf_values:
+                        patch_obj["custom_fields_values"] = lead_cf_values
+                    if patch_obj:
                         await session.patch(
                             f"{base_url}/api/v4/leads/{existing_lead_id}",
                             headers=_amocrm_headers(),
-                            json={
-                                "custom_fields_values": [
-                                    {"field_id": lead_tg_fid, "values": [{"value": tg_login}]}
-                                ]
-                            },
+                            json=patch_obj,
                             timeout=15,
                         )
                     await _add_amocrm_note(session, base_url, existing_lead_id, note_text)
                     return True, f"добавлено в сделку #{existing_lead_id}"
-
-                contact_fields: list[dict[str, Any]] = []
-                if phone:
-                    contact_fields.append({"field_code": "PHONE", "values": [{"value": phone, "enum_code": "MOB"}]})
-                if contact_tg_fid:
-                    contact_fields.append({"field_id": contact_tg_fid, "values": [{"value": tg_login}]})
 
                 lead_obj: dict[str, Any] = {"name": f"ЛунапаркЕда (Помощь): {safe_name} ({tg_login})"}
                 if AMOCRM_PIPELINE_ID:
                     lead_obj["pipeline_id"] = AMOCRM_PIPELINE_ID
                 if AMOCRM_STATUS_ID:
                     lead_obj["status_id"] = AMOCRM_STATUS_ID
-                if lead_tg_fid:
-                    lead_obj["custom_fields_values"] = [
-                        {"field_id": lead_tg_fid, "values": [{"value": tg_login}]}
-                    ]
+                if lead_cf_values:
+                    lead_obj["custom_fields_values"] = lead_cf_values
 
                 contact_payload: dict[str, Any] = {"first_name": safe_name}
-                if contact_fields:
-                    contact_payload["custom_fields_values"] = contact_fields
+                if contact_cf_values:
+                    contact_payload["custom_fields_values"] = contact_cf_values
 
                 payload = [{**lead_obj, "_embedded": {"contacts": [contact_payload]}}]
 
@@ -1400,6 +1495,21 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     contact_phone = str(contact_obj.get("phone_number") or "").strip()
     file_id = _extract_photo_file_id(message)
 
+    # Команда прямого ответа курьеру из бота: /reply <target_chat_id> <текст>
+    if raw_text.startswith("/reply "):
+        parts = raw_text.split(maxsplit=2)
+        if len(parts) < 3 or not parts[1].lstrip("-").isdigit():
+            await tg_send_text(chat_id, "Формат команды: /reply <chat_id> <текст ответа курьеру>")
+            return
+        target_chat_id = parts[1].strip()
+        reply_body = parts[2].strip()
+        sent_ok = await tg_send_text(target_chat_id, f"💬 Сообщение от парка ЛунапаркЕда:\n\n{reply_body}")
+        if sent_ok:
+            await tg_send_text(chat_id, f"✅ Ответ отправлен пользователю {target_chat_id}.")
+        else:
+            await tg_send_text(chat_id, f"⚠️ Не удалось отправить сообщение пользователю {target_chat_id}.")
+        return
+
     save_user_session(chat_id, phone=contact_phone, username=tg_username, full_name=contact_name)
     norm_cmd = normalize_choice_text(raw_text)
 
@@ -1415,7 +1525,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "help_waiting_problem", {"prev_step": prev_step, "prev_data": prev_data})
         await tg_send_text(
             chat_id,
-            "Добрый день! Опишите Вашу проблему — мы передадим её в amoCRM и сможем ответить вам в чате.",
+            "Добрый день! Опишите Вашу проблему — мы передадим её в amoCRM и ответим вам.",
             reply_markup=kb_step_with_help(),
         )
         return
@@ -1449,7 +1559,6 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             tg_username=tg_username,
             full_name=contact_name,
         )
-        # Отправляем через Wazzup только при обращении за помощью, чтобы менеджер мог ответить
         await send_help_via_wazzup(
             chat_id=chat_id,
             text=f"Обращение от {contact_name} ({format_tg_login(chat_id, tg_username)}):\n{problem_body}",
