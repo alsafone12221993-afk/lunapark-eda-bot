@@ -22,7 +22,6 @@ TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 AMOCRM_WEBHOOK_SECRET = os.getenv("AMOCRM_WEBHOOK_SECRET", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
-# Опциональный ИИ для простых вопросов (если задан ключ; иначе работают умные шаблоны + вариативность)
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.openai.com/v1/chat/completions").strip()
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini").strip()
@@ -63,16 +62,15 @@ AMOCRM_PIPELINE_ID = int(os.getenv("AMOCRM_PIPELINE_ID", "10053610"))
 AMOCRM_STATUS_ID = int(os.getenv("AMOCRM_STATUS_ID", "79731826"))
 AMOCRM_CLOSED_LOST_ID = int(os.getenv("AMOCRM_CLOSED_LOST_ID", "143"))
 
-# Точные ID полей по выгрузке amoCRM
-LEAD_FIELD_DRIVER_TYPE = 2815163   # Тип водителя/курьера (select)
-LEAD_FIELD_PRO_NUMBER = 2818307    # НОМЕР В ПРО (numeric)
-LEAD_FIELD_CITY_LIST = 2840190     # Город (список) (select)
+LEAD_FIELD_DRIVER_TYPE = 2815163
+LEAD_FIELD_PRO_NUMBER = 2818307
+LEAD_FIELD_CITY_LIST = 2840190
 
-CONTACT_FIELD_PHONE_MULTI = 2205563  # Телефон (multitext)
-CONTACT_ENUM_PHONE_MOB = 4831969     # MOB
-CONTACT_FIELD_CITY = 2520625         # Город (text)
-CONTACT_FIELD_FIO = 2815893          # ФИО (text)
-CONTACT_FIELD_PHONE_TEXT = 2854331   # номер телефона (text)
+CONTACT_FIELD_PHONE_MULTI = 2205563
+CONTACT_ENUM_PHONE_MOB = 4831969
+CONTACT_FIELD_CITY = 2520625
+CONTACT_FIELD_FIO = 2815893
+CONTACT_FIELD_PHONE_TEXT = 2854331
 
 DRIVER_TYPE_ENUM_MAP: dict[str, int] = {
     "пеший доставка": 5241175,
@@ -88,7 +86,6 @@ DRIVER_TYPE_ENUM_MAP: dict[str, int] = {
     "такси": 5302385,
 }
 
-# Полный справочник городов из поля «Город (список)» (field_id=2840190)
 CITY_LIST_ENUM_MAP: dict[str, int] = {
     "санкт-петербург": 5301604,
     "москва": 5301538,
@@ -1975,6 +1972,21 @@ def _safe_float(val: Any) -> float:
         return 0.0
 
 
+def _normalize_dist_value_to_km(raw_val: Any, unit_hint: str = "") -> float:
+    v = _safe_float(raw_val)
+    if v <= 0:
+        return 0.0
+    uh = (unit_hint or "").lower()
+    if "meter" in uh or "метр" in uh or uh == "m":
+        return v / 1000.0
+    if "km" in uh or "километр" in uh:
+        return v
+    # Если число крупное (например 4200 метров), считаем что это метры
+    if v >= 200:
+        return v / 1000.0
+    return v
+
+
 def _extract_order_distance_km(order: dict[str, Any]) -> float:
     direct_km_keys = (
         "distance_km",
@@ -1982,6 +1994,7 @@ def _extract_order_distance_km(order: dict[str, Any]) -> float:
         "route_length_km",
         "paid_distance_km",
         "total_distance_km",
+        "order_distance_km",
     )
     for key in direct_km_keys:
         if key in order and order[key] is not None:
@@ -1997,6 +2010,7 @@ def _extract_order_distance_km(order: dict[str, Any]) -> float:
         "total_distance",
         "pickup_distance",
         "delivery_distance",
+        "order_distance",
     )
     total_km = 0.0
     for key in dist_keys:
@@ -2009,32 +2023,38 @@ def _extract_order_distance_km(order: dict[str, Any]) -> float:
                 if v > 0:
                     total_km += v
                     continue
+            if raw_v.get("kilometers") is not None:
+                v = _safe_float(raw_v["kilometers"])
+                if v > 0:
+                    total_km += v
+                    continue
             if raw_v.get("meters") is not None:
                 v = _safe_float(raw_v["meters"]) / 1000.0
                 if v > 0:
                     total_km += v
                     continue
+            unit_str = str(raw_v.get("unit") or raw_v.get("units") or "")
             for sub_k in ("value", "amount", "distance"):
                 if sub_k in raw_v and raw_v[sub_k] is not None:
-                    sv = _safe_float(raw_v[sub_k])
+                    sv = _normalize_dist_value_to_km(raw_v[sub_k], unit_str)
                     if sv > 0:
-                        total_km += sv / 1000.0 if sv >= 100 else sv
+                        total_km += sv
                         break
         else:
-            v = _safe_float(raw_v)
+            v = _normalize_dist_value_to_km(raw_v, key)
             if v > 0:
-                total_km += v / 1000.0 if v >= 100 else v
+                total_km += v
 
     if total_km > 0:
         return total_km
 
     route_obj = order.get("route")
     if isinstance(route_obj, dict):
-        for rk in ("distance", "length", "km", "meters"):
+        for rk in ("distance_km", "km", "distance", "length", "meters"):
             if rk in route_obj and route_obj[rk] is not None:
-                rv = _safe_float(route_obj[rk])
+                rv = _normalize_dist_value_to_km(route_obj[rk], rk)
                 if rv > 0:
-                    return rv / 1000.0 if (rk == "meters" or rv >= 100) else rv
+                    return rv
 
     return 0.0
 
@@ -2220,7 +2240,7 @@ async def _find_all_profiles_by_phone(
 
 
 def _parse_order_dt(order: dict[str, Any]) -> Optional[datetime]:
-    for key in ("booked_at", "ended_at", "created_at"):
+    for key in ("booked_at", "ended_at", "created_at", "updated_at"):
         raw = order.get(key)
         if not raw:
             continue
@@ -2296,7 +2316,7 @@ async def _get_driver_orders_stats(
                     },
                 }
             },
-            "limit": 300,
+            "limit": 500,
         }
 
         try:
@@ -2312,6 +2332,7 @@ async def _get_driver_orders_stats(
                 "completed_goal": 0,
                 "within_goal_window": now <= goal_end,
                 "distance_km_7d": 0.0,
+                "distance_estimated": False,
             }
 
         completed_7d = 0
@@ -2332,11 +2353,6 @@ async def _get_driver_orders_stats(
                 if odt is None or (goal_start_dt <= odt <= goal_end):
                     completed_goal += 1
 
-        distance_estimated = False
-        if completed_7d > 0 and distance_km_7d == 0.0:
-            distance_km_7d = round(completed_7d * 2.4, 1)
-            distance_estimated = True
-
         result = {
             "ok": True,
             "error": "",
@@ -2344,7 +2360,7 @@ async def _get_driver_orders_stats(
             "completed_goal": completed_goal,
             "within_goal_window": now <= goal_end,
             "distance_km_7d": round(distance_km_7d, 1),
-            "distance_estimated": distance_estimated,
+            "distance_estimated": False,
         }
         DRIVER_STATS_CACHE[cache_key] = {"ts": now_mono, "data": result}
         return result
@@ -2452,7 +2468,7 @@ async def _get_driver_adjustments_list(
     return lines[:20]
 
 
-# ================= АДМИНКА (ТОЧНЫЙ ПОДСЧЁТ АКТИВНЫХ И НА ЗАКАЗАХ), СПБ/МСК И СПРОС =================
+# ================= АДМИНКА, СПБ/МСК И СПРОС =================
 def _classify_transport_bucket(transport_str: str) -> str:
     low = (transport_str or "").lower()
     if "груз" in low:
@@ -2465,7 +2481,6 @@ def _classify_transport_bucket(transport_str: str) -> str:
 
 
 async def get_live_park_activity_stats() -> dict[str, int]:
-    """Точный подсчёт по уникальным профилям водителей/курьеров в парке."""
     working_ids: set[str] = set()
     online_ids: set[str] = set()
     on_order_ids: set[str] = set()
@@ -2900,7 +2915,9 @@ async def show_courier_statistics(chat_id: int | str, driver: dict[str, Any]) ->
     goal_start = get_goal_start_dt(chat_id)
     try:
         async with aiohttp.ClientSession() as session:
-            stats = await _get_driver_orders_stats(session, park, driver["id"], goal_start_dt=goal_start)
+            stats = await _get_driver_orders_stats(
+                session, park, driver["id"], goal_start_dt=goal_start, force_refresh=True
+            )
     except Exception:
         stats = {
             "completed_7d": 0,
@@ -3227,7 +3244,6 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     is_super = is_superadmin_user(sender_id, chat_id)
     is_adm = is_admin_user(sender_id, chat_id)
 
-    # Команды суперадмина / админа через слеш
     if raw_text.startswith("/addadmin"):
         if not is_super:
             await send_ephemeral_text(chat_id, "Назначать админов может только суперадмин.")
@@ -3412,7 +3428,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if unbind_phone_owner(target_p):
             await tg_send_text(chat_id, f"🔓 Привязка номера {target_p} сброшена.", reply_markup=kb_admin_menu(True))
         else:
-            await send_ephemeral_text(chat_id, f"Номер {target_p} не был привязан.", reply_markup=kb_admin_menu(True))
+            await tg_send_text(chat_id, f"Номер {target_p} не был привязан.", reply_markup=kb_admin_menu(True))
         return
 
     if is_adm and norm_cmd in ("админка", "сводка за период"):
@@ -4016,7 +4032,6 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         await send_ephemeral_text(chat_id, "Выбери поле для изменения:", reply_markup=kb_edit_field_choice(data), ttl_sec=15)
         return
 
-    # Простой автоответчик / ИИ на частые простые вопросы в свободном режиме
     if step is None and raw_text:
         ai_ans = await answer_simple_question_with_ai(raw_text)
         if ai_ans:
@@ -4030,11 +4045,76 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     await send_start_menu(chat_id, first_name=first_name)
 
 
+async def _fetch_contact_phones_from_amocrm(
+    lead_id: str | None = None,
+    contact_id: str | None = None,
+) -> list[str]:
+    if not AMOCRM_BASE_URL or not AMOCRM_ACCESS_TOKEN:
+        return []
+    base_url = AMOCRM_BASE_URL.rstrip("/")
+    contact_ids: list[str] = []
+    if contact_id and str(contact_id).isdigit():
+        contact_ids.append(str(contact_id))
+
+    phones: list[str] = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            if not contact_ids and lead_id and str(lead_id).isdigit():
+                async with session.get(
+                    f"{base_url}/api/v4/leads/{lead_id}",
+                    params={"with": "contacts"},
+                    headers=_amocrm_headers(),
+                    timeout=15,
+                ) as lresp:
+                    if lresp.status == 200:
+                        ldata = await lresp.json()
+                        for c in (ldata.get("_embedded") or {}).get("contacts") or []:
+                            if isinstance(c, dict) and c.get("id"):
+                                contact_ids.append(str(c["id"]))
+
+            for cid in contact_ids:
+                async with session.get(
+                    f"{base_url}/api/v4/contacts/{cid}",
+                    headers=_amocrm_headers(),
+                    timeout=15,
+                ) as cresp:
+                    if cresp.status != 200:
+                        continue
+                    cdata = await cresp.json()
+                    for cf in cdata.get("custom_fields_values") or []:
+                        if not isinstance(cf, dict):
+                            continue
+                        fcode = str(cf.get("field_code") or "").upper()
+                        fname = str(cf.get("field_name") or "").lower()
+                        if fcode == "PHONE" or "телефон" in fname or cf.get("field_id") == CONTACT_FIELD_PHONE_MULTI:
+                            for val in cf.get("values") or []:
+                                if isinstance(val, dict) and val.get("value"):
+                                    phones.append(normalize_phone(str(val["value"])))
+    except Exception as exc:
+        logger.warning("Не удалось получить телефон контакта из amoCRM: %s", exc)
+    return phones
+
+
+def _find_tg_by_phone_in_users_db(phones: list[str]) -> str | None:
+    if not phones:
+        return None
+    norm_set = {normalize_phone(p) for p in phones if p}
+    users_db = _read_json(USERS_FILE, {})
+    if not isinstance(users_db, dict):
+        return None
+    for uid, rec in users_db.items():
+        if not isinstance(rec, dict):
+            continue
+        up = normalize_phone(str(rec.get("phone") or ""))
+        if up and up in norm_set:
+            return str(uid)
+    return None
+
+
 async def _fetch_latest_amocrm_note_text(
     lead_id: str | None = None,
     contact_id: str | None = None,
 ) -> str:
-    """Дочитывает последнее примечание из сделки или контакта в amoCRM через API."""
     if not AMOCRM_BASE_URL or not AMOCRM_ACCESS_TOKEN:
         return ""
     base_url = AMOCRM_BASE_URL.rstrip("/")
@@ -4049,10 +4129,11 @@ async def _fetch_latest_amocrm_note_text(
             for url in targets:
                 async with session.get(
                     url,
-                    params={"limit": 5, "order[created_at]": "desc"},
+                    params={"limit": 10, "order[created_at]": "desc"},
                     headers=_amocrm_headers(),
                     timeout=15,
                 ) as resp:
+                    logger.info("amoCRM notes GET %s -> status %s", url, resp.status)
                     if resp.status != 200:
                         continue
                     data = await resp.json()
@@ -4065,6 +4146,7 @@ async def _fetch_latest_amocrm_note_text(
                             continue
                         if txt.startswith("Парк: ЛунапаркЕда") or txt.startswith("Обращение по кнопке"):
                             continue
+                        logger.info("Найдено примечание в amoCRM: %s", txt[:120])
                         return txt
     except Exception as exc:
         logger.warning("Не удалось дочитать примечание из amoCRM: %s", exc)
@@ -4086,7 +4168,6 @@ def _extract_reply_from_note(raw_note: str) -> str:
 
 
 async def handle_amocrm_webhook(request: web.Request) -> web.Response:
-    """Приём вебхуков из amoCRM и отправка ответа курьеру в Telegram."""
     if AMOCRM_WEBHOOK_SECRET:
         secret = request.query.get("secret") or request.headers.get("X-AmoCRM-Secret", "")
         if not hmac.compare_digest(secret, AMOCRM_WEBHOOK_SECRET):
@@ -4136,8 +4217,21 @@ async def handle_amocrm_webhook(request: web.Request) -> web.Response:
                             if isinstance(notes, list) and notes and isinstance(notes[0], dict) and not note_text:
                                 note_text = str((notes[0].get("params") or {}).get("text") or notes[0].get("text") or "").strip()
 
+    logger.info("amoCRM webhook parsed: lead_id=%s, contact_id=%s, note_text=%s", lead_id, contact_id, note_text[:80])
+
     target_tg_id = find_tg_chat_by_crm_entity(lead_id=lead_id, contact_id=contact_id)
     if not target_tg_id:
+        phones = await _fetch_contact_phones_from_amocrm(lead_id=lead_id, contact_id=contact_id)
+        target_tg_id = _find_tg_by_phone_in_users_db(phones)
+        if target_tg_id and (lead_id or contact_id):
+            link_crm_entity_to_tg(
+                int(lead_id) if lead_id and lead_id.isdigit() else None,
+                int(contact_id) if contact_id and contact_id.isdigit() else None,
+                target_tg_id,
+            )
+
+    if not target_tg_id:
+        logger.info("amoCRM webhook ignored: no_tg_binding (lead_id=%s, contact_id=%s)", lead_id, contact_id)
         return web.json_response({"ok": True, "ignored": "no_tg_binding", "lead_id": lead_id, "contact_id": contact_id})
 
     clean_reply = _extract_reply_from_note(note_text)
@@ -4146,9 +4240,11 @@ async def handle_amocrm_webhook(request: web.Request) -> web.Response:
         clean_reply = _extract_reply_from_note(fetched_note)
 
     if not clean_reply:
+        logger.info("amoCRM webhook ignored: no_tg_or_reply_prefix (lead_id=%s, contact_id=%s)", lead_id, contact_id)
         return web.json_response({"ok": True, "ignored": "no_tg_or_reply_prefix"})
 
     sent_mid = await tg_send_text(target_tg_id, f"💬 Сообщение от менеджера парка:\n\n{clean_reply}")
+    logger.info("amoCRM webhook sent to tg=%s, msg_id=%s", target_tg_id, sent_mid)
     return web.json_response({"ok": bool(sent_mid), "sent_to": target_tg_id})
 
 
