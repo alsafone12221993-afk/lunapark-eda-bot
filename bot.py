@@ -20,14 +20,20 @@ PORT = int(os.getenv("PORT", "8080"))
 # Время жизни исчезающих сообщений (в секундах)
 EPHEMERAL_TTL_SEC = int(os.getenv("EPHEMERAL_TTL_SEC", "25"))
 
-# Telegram ID операторов / администраторов
-_raw_admins = os.getenv("OPERATOR_ADMIN_IDS", "673430213").strip()
-OPERATOR_ADMIN_IDS: set[str] = {
+# Суперадмин (только этот ID может назначать и снимать админов)
+SUPERADMIN_ID = os.getenv("SUPERADMIN_ID", "673430213").strip()
+
+# Начальные админы / операторы (дополнительно управляются через /addadmin и /deladmin)
+_raw_admins = os.getenv("OPERATOR_ADMIN_IDS", SUPERADMIN_ID).strip()
+INITIAL_ADMIN_IDS: set[str] = {
     x.strip() for x in _raw_admins.split(",") if x.strip()
-}
+} | {SUPERADMIN_ID}
 
 # ID чата/группы операторов для уведомлений по «Помощи» и живых диалогов
-OPERATOR_CHAT_ID = os.getenv("OPERATOR_CHAT_ID", "673430213").strip()
+OPERATOR_CHAT_ID = os.getenv("OPERATOR_CHAT_ID", SUPERADMIN_ID).strip()
+
+# Порог почасового спроса по умолчанию
+DEMAND_RATE_RUB_PER_HOUR = int(os.getenv("DEMAND_RATE_RUB_PER_HOUR", "800"))
 
 # Основной парк (Яндекс Fleet API)
 PARKS_CONFIG: list[dict[str, str]] = [
@@ -68,6 +74,8 @@ STATES_FILE = "user_states.json"
 DELAYED_TASKS_FILE = "delayed_notifications.json"
 LIVE_CHATS_FILE = "live_chats.json"
 EPHEMERAL_MSGS_FILE = "ephemeral_messages.json"
+ADMIN_CONFIG_FILE = "admin_config.json"
+PENDING_DEMANDS_FILE = "pending_demands.json"
 
 FLEET_API_URL = "https://fleet-api.taxi.yandex.net"
 
@@ -75,6 +83,7 @@ GOAL_ORDERS = 5
 GOAL_DAYS = 14
 GOAL_BONUS = 500
 PROFILE_READY_DELAY_SEC = 600
+AFTER_10M_REMINDER_DELAY_SEC = 5
 
 DRIVERS_CACHE: dict[str, dict[str, Any]] = {}
 DRIVERS_TTL_SEC = 3600
@@ -99,28 +108,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger("lunapark_bot")
 
+IOS_URL = "https://apps.apple.com/ru/app/%D1%8F%D0%BD%D0%B4%D0%B5%D0%BA%D1%81-%D0%BF%D1%80%D0%BE-%D0%B2%D0%BE%D0%B4%D0%B8%D1%82%D0%B5%D0%BB%D0%B8-%D0%B8-%D0%BA%D1%83%D1%80%D1%8C%D0%B5%D1%80%D1%8B/id1496904594"
+ANDROID_URL = "https://play.google.com/store/apps/details?id=ru.yandex.taximeter&hl=ru"
+RUSTORE_URL = "https://www.rustore.ru/catalog/app/ru.yandex.taximeter"
+
 MSG_AFTER_SUBMIT = (
-    "Заявка принята! Профиль создадим в течение 10 минут.\n\n"
-    "Пока можно сразу скачать Яндекс Про:\n"
-    "— iOS: https://apps.apple.com/ru/app/%D1%8F%D0%BD%D0%B4%D0%B5%D0%BA%D1%81-%D0%BF%D1%80%D0%BE-%D0%B2%D0%BE%D0%B4%D0%B8%D1%82%D0%B5%D0%BB%D0%B8-%D0%B8-%D0%BA%D1%83%D1%80%D1%8C%D0%B5%D1%80%D1%8B/id1496904594\n"
-    "— Android: https://play.google.com/store/apps/details?id=ru.yandex.taximeter&hl=ru"
+    "✅ Заявка принята! Профиль создадим в течение 10 минут.\n\n"
+    "Пока можно скачать Яндекс Про:\n"
+    f"🍎 <a href=\"{IOS_URL}\">iOS (App Store)</a>\n"
+    f"🤖 <a href=\"{ANDROID_URL}\">Android (Google Play)</a>\n"
+    f"🛒 <a href=\"{RUSTORE_URL}\">RuStore</a>"
 )
 
 MSG_PROFILE_CREATED_10M = (
-    "Профиль создан!\n\n"
-    "Как начать:\n"
-    "1. Откройте Яндекс Про и войдите по своему номеру телефона.\n"
-    "2. Выберите сервис Еда и парк ЛунапаркЕда.\n"
-    "3. Пройдите фотоконтроль и обучение, затем выходите на слот.\n\n"
-    "Условия работы в парке ЛунапаркЕда:\n"
-    "— Комиссия парка: 3%\n"
-    "— Бонус от парка: +500 ₽ за первые 5 заказов в течение 14 дней\n"
-    "— Бонус для новых курьеров Яндекс Еды: +13 000 ₽ за 100 заказов в первые 20 дней с момента регистрации\n\n"
-    "Как выводить деньги:\n"
-    "Вывод моментальный через приложение JumpTaxi (от 100 ₽):\n"
-    "— На карты Т-Банка от 2 000 ₽ — без комиссии (0%)\n"
-    "— На остальные карты — комиссия 1% (минимум 30 ₽)\n\n"
-    "Подробная инструкция по настройке и выводу средств: https://t.me/LUNAPARK_study/52"
+    "🎉 Профиль создан! Добро пожаловать в команду ЛунапаркЕда!\n\n"
+    "Вот простые шаги, чтобы быстро стартовать:\n"
+    "📱 Заходи в Яндекс Про по своему номеру телефона\n"
+    "🍔 Выбирай сервис Еда и парк ЛунапаркЕда\n"
+    "📸 Проходи фотоконтроль, получи термокороб, пройди обучение и выбери удобный слот для работы!\n"
+    "🛵 Обязательно нажми на \"Профиль\" далее \"Тип передвижения\" и выбери как будешь доставлять посылки.\n"
+    "🩺 Не забудь оформить медицинскую книжку, но первое время можно работать без нее.\n\n"
+    "Если возникнут вопросы — мы всегда рядом и подскажем!"
+)
+
+MSG_AFTER_10M_CABINET_HINT = (
+    "💡 Чтобы смотреть статистику, цели и корректировки в боте, нажми «✅ Уже курьер»."
 )
 
 
@@ -145,10 +157,31 @@ def _reply_kb(
     }
 
 
-def kb_start_menu() -> dict[str, Any]:
-    return _reply_kb([
+def kb_start_menu(is_admin: bool = False) -> dict[str, Any]:
+    rows: list[list[str | dict[str, Any]]] = [
         ["🚀 Подключиться", "✅ Уже курьер"],
         ["❓ Помощь"],
+    ]
+    if is_admin:
+        rows.append(["🛠 Админка", "⏱ Заказы в час"])
+    return _reply_kb(rows)
+
+
+def kb_admin_menu(is_superadmin: bool = False) -> dict[str, Any]:
+    rows: list[list[str | dict[str, Any]]] = [
+        ["📊 Сводка за период", "⏱ Заказы в час"],
+        ["📣 Рассылка", "🔥 Проверить спрос"],
+    ]
+    if is_superadmin:
+        rows.append(["👥 Список админов"])
+    rows.append(["⬅️ В начало"])
+    return _reply_kb(rows)
+
+
+def kb_cancel_questions_choice() -> dict[str, Any]:
+    return _reply_kb([
+        ["Да", "Нет"],
+        ["⬅️ В начало"],
     ])
 
 
@@ -164,12 +197,14 @@ def kb_transport_choice() -> dict[str, Any]:
         ["🚶 Пеший / Вело", "🛵 Мото"],
         ["🚗 Авто", "🚚 Грузовой"],
         ["❓ Помощь", "❌ Отмена"],
+        ["⬅️ В начало"],
     ])
 
 
 def kb_step_with_help() -> dict[str, Any]:
     return _reply_kb([
         ["❓ Помощь", "❌ Отмена"],
+        ["⬅️ В начало"],
     ])
 
 
@@ -177,6 +212,7 @@ def kb_courier_phone_auth() -> dict[str, Any]:
     return _reply_kb([
         [{"text": "📱 Отправить номер профиля", "request_contact": True}],
         ["❓ Помощь", "❌ Отмена"],
+        ["⬅️ В начало"],
     ])
 
 
@@ -184,6 +220,7 @@ def kb_confirm_application() -> dict[str, Any]:
     return _reply_kb([
         ["Да", "Исправить"],
         ["❓ Помощь", "❌ Отмена"],
+        ["⬅️ В начало"],
     ])
 
 
@@ -195,7 +232,7 @@ def kb_edit_field_choice(data: dict[str, Any]) -> dict[str, Any]:
     if requires_two_sided_sts(data.get("transport", "")):
         rows.append(["Изменить фото СТС"])
     rows.append(["Назад к проверке", "❓ Помощь"])
-    rows.append(["❌ Отмена"])
+    rows.append(["❌ Отмена", "⬅️ В начало"])
     return _reply_kb(rows)
 
 
@@ -212,7 +249,7 @@ def kb_profiles_choice(profiles: list[dict[str, Any]]) -> dict[str, Any]:
     for idx, prof in enumerate(profiles[:10]):
         rows.append([f"{idx + 1}. {prof['park_name']}"])
     rows.append(["Хочу ввести другой номер", "❓ Помощь"])
-    rows.append(["❌ Отмена"])
+    rows.append(["❌ Отмена", "⬅️ В начало"])
     return _reply_kb(rows)
 
 
@@ -310,10 +347,73 @@ def requires_two_sided_sts(transport_text: str) -> bool:
     return any(k in low for k in STS_TRANSPORT_KEYWORDS)
 
 
-def is_operator_user(user_id: int | str, chat_id: int | str) -> bool:
-    if not OPERATOR_ADMIN_IDS:
-        return False
-    return str(user_id) in OPERATOR_ADMIN_IDS or str(chat_id) in OPERATOR_ADMIN_IDS
+# ================= ПРАВА СУПЕРАДМИНА И АДМИНОВ =================
+def load_admin_config() -> dict[str, Any]:
+    raw = _read_json(ADMIN_CONFIG_FILE, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    admins = raw.get("admins")
+    if not isinstance(admins, list):
+        admins = sorted(INITIAL_ADMIN_IDS)
+    admin_set = {str(x).strip() for x in admins if str(x).strip()} | {SUPERADMIN_ID}
+    period_days = raw.get("period_days", 7)
+    try:
+        period_days = max(1, min(365, int(period_days)))
+    except Exception:
+        period_days = 7
+    return {"admins": sorted(admin_set), "period_days": period_days}
+
+
+def save_admin_config(cfg: dict[str, Any]) -> None:
+    admin_set = {str(x).strip() for x in (cfg.get("admins") or []) if str(x).strip()} | {SUPERADMIN_ID}
+    period_days = cfg.get("period_days", 7)
+    try:
+        period_days = max(1, min(365, int(period_days)))
+    except Exception:
+        period_days = 7
+    _write_json(ADMIN_CONFIG_FILE, {"admins": sorted(admin_set), "period_days": period_days})
+
+
+def is_superadmin_user(user_id: int | str, chat_id: int | str) -> bool:
+    return str(user_id) == SUPERADMIN_ID or str(chat_id) == SUPERADMIN_ID
+
+
+def is_admin_user(user_id: int | str, chat_id: int | str) -> bool:
+    cfg = load_admin_config()
+    admin_set = set(cfg["admins"])
+    return str(user_id) in admin_set or str(chat_id) in admin_set
+
+
+def get_admin_period_days() -> int:
+    return int(load_admin_config().get("period_days", 7))
+
+
+def set_admin_period_days(days: int) -> int:
+    cfg = load_admin_config()
+    cfg["period_days"] = max(1, min(365, int(days)))
+    save_admin_config(cfg)
+    return cfg["period_days"]
+
+
+def add_admin_id(new_id: str) -> list[str]:
+    cfg = load_admin_config()
+    s = set(cfg["admins"]) | {str(new_id).strip(), SUPERADMIN_ID}
+    cfg["admins"] = sorted(x for x in s if x)
+    save_admin_config(cfg)
+    return cfg["admins"]
+
+
+def remove_admin_id(target_id: str) -> tuple[bool, list[str]]:
+    clean = str(target_id).strip()
+    if clean == SUPERADMIN_ID:
+        return False, load_admin_config()["admins"]
+    cfg = load_admin_config()
+    s = set(cfg["admins"])
+    s.discard(clean)
+    s.add(SUPERADMIN_ID)
+    cfg["admins"] = sorted(s)
+    save_admin_config(cfg)
+    return True, cfg["admins"]
 
 
 # ================= ЖИВОЙ ДИАЛОГ ОПЕРАТОР <-> КУРЬЕР =================
@@ -440,8 +540,10 @@ def save_user_session(
     entry = db.get(key)
     if not isinstance(entry, dict):
         entry = {}
+    now_iso = datetime.now(timezone.utc).isoformat()
     if not entry.get("registered_at"):
-        entry["registered_at"] = datetime.now(timezone.utc).isoformat()
+        entry["registered_at"] = now_iso
+    entry["last_seen_at"] = now_iso
     if phone:
         entry["phone"] = normalize_phone(phone)
     if park_id:
@@ -466,7 +568,6 @@ def get_user_record(chat_id: int | str) -> dict[str, Any]:
 
 
 def get_goal_start_dt(chat_id: int | str) -> datetime:
-    """Точка отсчёта 14-дневной цели: берём актуальное окно последних 14 дней либо дату регистрации, если она свежее."""
     now = datetime.now(timezone.utc)
     default_start = now - timedelta(days=GOAL_DAYS)
     rec = get_user_record(chat_id)
@@ -475,7 +576,6 @@ def get_goal_start_dt(chat_id: int | str) -> datetime:
         try:
             dt = datetime.fromisoformat(str(raw))
             dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-            # Если запись создана сегодня/недавно, но до начала работы в парке, берём более раннюю границу в пределах 14 дней
             return min(dt, default_start)
         except Exception:
             pass
@@ -488,6 +588,7 @@ def save_application(lead_payload: dict[str, Any]) -> None:
         apps = []
     record = dict(lead_payload)
     record["created_at"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+    record["created_ts"] = time.time()
     record["status"] = "Принята в работу"
     apps.append(record)
     _write_json(APPS_FILE, apps)
@@ -520,6 +621,7 @@ async def tg_send_text(
     chat_id: int | str,
     text: str,
     reply_markup: dict[str, Any] | None = None,
+    parse_mode: str | None = None,
 ) -> int | None:
     if not TELEGRAM_BOT_TOKEN:
         logger.error("Не задан TELEGRAM_BOT_TOKEN")
@@ -530,6 +632,8 @@ async def tg_send_text(
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
         async with aiohttp.ClientSession() as session:
             res = await tg_api(session, "sendMessage", payload)
@@ -659,22 +763,31 @@ async def tg_download_file(file_id: str, default_name: str) -> Optional[tuple[by
         return None
 
 
-# ================= ОТЛОЖЕННОЕ СООБЩЕНИЕ ЧЕРЕЗ 10 МИНУТ ПОСЛЕ ЗАЯВКИ =================
+# ================= ОТЛОЖЕННОЕ СООБЩЕНИЕ ЧЕРЕЗ 10 МИНУТ + ДОП. СООБЩЕНИЕ ЧЕРЕЗ 5 СЕК =================
 def schedule_delayed_profile_msg(chat_id: int | str, delay_sec: int = PROFILE_READY_DELAY_SEC) -> None:
     tasks = _read_json(DELAYED_TASKS_FILE, [])
     if not isinstance(tasks, list):
         tasks = []
+    now = time.time()
     tasks.append({
         "id": str(uuid.uuid4()),
+        "kind": "profile_ready",
         "chat_id": str(chat_id),
-        "send_at": time.time() + delay_sec,
+        "send_at": now + delay_sec,
         "text": MSG_PROFILE_CREATED_10M,
+    })
+    tasks.append({
+        "id": str(uuid.uuid4()),
+        "kind": "cabinet_hint",
+        "chat_id": str(chat_id),
+        "send_at": now + delay_sec + AFTER_10M_REMINDER_DELAY_SEC,
+        "text": MSG_AFTER_10M_CABINET_HINT,
     })
     _write_json(DELAYED_TASKS_FILE, tasks)
 
 
 async def delayed_notifications_worker() -> None:
-    logger.info("Запущен фоновый воркер автосообщений через 10 мин после заявки")
+    logger.info("Запущен фоновый воркер автосообщений через 10 мин (+5 сек подсказка)")
     while True:
         try:
             async with _FILE_LOCKS["delayed_tasks"]:
@@ -689,9 +802,13 @@ async def delayed_notifications_worker() -> None:
                             continue
                         if now >= float(task.get("send_at", 0)):
                             cid = str(task.get("chat_id") or "")
+                            kind = str(task.get("kind") or "profile_ready")
                             txt = str(task.get("text") or MSG_PROFILE_CREATED_10M)
-                            mid = await tg_send_text(cid, txt, reply_markup=kb_start_menu())
+                            is_adm = is_admin_user(cid, cid)
+                            mid = await tg_send_text(cid, txt, reply_markup=kb_start_menu(is_admin=is_adm))
                             if mid:
+                                if kind == "cabinet_hint":
+                                    schedule_ephemeral_delete(cid, mid, ttl_sec=45)
                                 changed = True
                             else:
                                 task["send_at"] = now + 30
@@ -705,7 +822,7 @@ async def delayed_notifications_worker() -> None:
             break
         except Exception as exc:
             logger.exception("Ошибка в воркере отложенных уведомлений: %s", exc)
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)
 
 
 # ================= AMOCRM =================
@@ -1050,9 +1167,9 @@ async def send_lead_to_amocrm(
                     ],
                 )
 
-                contact_cf_values: list[dict[str, Any]] = [
-                    {"field_code": "PHONE", "values": [{"value": phone, "enum_code": "MOB"}]}
-                ]
+                contact_cf_values: list[dict[str, Any]] = []
+                if phone:
+                    contact_cf_values.append({"field_code": "PHONE", "values": [{"value": phone, "enum_code": "MOB"}]})
                 extra_contact_cf = _build_custom_fields_values(
                     contact_fields_cat,
                     [
@@ -1307,7 +1424,6 @@ def _safe_float(val: Any) -> float:
 
 
 def _extract_order_distance_km(order: dict[str, Any]) -> float:
-    """Достаёт дистанцию заказа в км из всех возможных полей ответа Fleet API."""
     direct_km_keys = (
         "distance_km",
         "mileage_km",
@@ -1647,7 +1763,6 @@ async def _get_driver_orders_stats(
                 if odt is None or (goal_start_dt <= odt <= goal_end):
                     completed_goal += 1
 
-        # Если API не вернул километраж по заказам (0.0), но заказы есть — подставляем среднюю оценку по заказам
         distance_estimated = False
         if completed_7d > 0 and distance_km_7d == 0.0:
             distance_km_7d = round(completed_7d * 2.4, 1)
@@ -1682,7 +1797,6 @@ async def _get_driver_adjustments_list(
     driver_id: str,
     force_refresh: bool = False,
 ) -> list[str]:
-    """Возвращает список строк строго по корректировкам и штрафам/нарушениям."""
     cache_key = f"adj_v3:{park['park_id']}:{driver_id}"
     now_mono = time.monotonic()
     cached = DRIVER_FINES_CACHE.get(cache_key)
@@ -1724,7 +1838,6 @@ async def _get_driver_adjustments_list(
         except Exception:
             continue
 
-    # Строго отсекаем налоги, переводы, выплаты и комиссии
     excluded_words = (
         "налог",
         "ндфл",
@@ -1770,6 +1883,299 @@ async def _get_driver_adjustments_list(
     return lines[:20]
 
 
+# ================= АДМИНКА, СПБ/МСК «ЗАКАЗЫ В ЧАС» И СПРОС ПО ГОРОДАМ =================
+def _classify_transport_bucket(transport_str: str) -> str:
+    low = (transport_str or "").lower()
+    if "груз" in low:
+        return "cargo"
+    if "мот" in low or "скут" in low:
+        return "moto"
+    if "авто" in low or "маш" in low or "легк" in low:
+        return "auto"
+    return "walk_bike"
+
+
+def build_admin_summary_text(period_days: int) -> str:
+    users_db = _read_json(USERS_FILE, {})
+    apps = _read_json(APPS_FILE, [])
+    if not isinstance(users_db, dict):
+        users_db = {}
+    if not isinstance(apps, list):
+        apps = []
+
+    cutoff_ts = time.time() - period_days * 86400
+    total_bot_users = len(users_db)
+    active_in_period = 0
+
+    for rec in users_db.values():
+        if not isinstance(rec, dict):
+            continue
+        raw_dt = rec.get("last_seen_at") or rec.get("registered_at")
+        if raw_dt:
+            try:
+                ts = datetime.fromisoformat(str(raw_dt).replace("Z", "+00:00")).timestamp()
+                if ts >= cutoff_ts:
+                    active_in_period += 1
+                continue
+            except Exception:
+                pass
+        active_in_period += 1
+
+    new_leads_cnt = 0
+    buckets = {"walk_bike": 0, "moto": 0, "auto": 0, "cargo": 0}
+
+    for app_item in apps:
+        if not isinstance(app_item, dict):
+            continue
+        ts = app_item.get("created_ts")
+        if ts is None and app_item.get("created_at"):
+            try:
+                ts = datetime.strptime(str(app_item["created_at"]), "%d.%m.%Y %H:%M").timestamp()
+            except Exception:
+                ts = time.time()
+        if float(ts or 0) >= cutoff_ts:
+            new_leads_cnt += 1
+            b = _classify_transport_bucket(str(app_item.get("transport") or ""))
+            buckets[b] += 1
+
+    return (
+        f"🛠 Админка ЛунапаркЕда (период: {period_days} дн.)\n\n"
+        f"👥 Всего в базе бота: {total_bot_users}\n"
+        f"🟢 Активных за период: {active_in_period}\n"
+        f"📥 Новых лидов за период: {new_leads_cnt}\n\n"
+        f"Регистрации по транспорту:\n"
+        f"🚶 Пешие / Вело: {buckets['walk_bike']}\n"
+        f"🛵 Мото: {buckets['moto']}\n"
+        f"🚗 Авто: {buckets['auto']}\n"
+        f"🚚 Грузовые: {buckets['cargo']}\n\n"
+        f"Команды:\n"
+        f"• /period <дни> — сменить период\n"
+        f"• /broadcast <текст> — массовая рассылка\n"
+        f"• /addadmin <tg_id> / /deladmin <tg_id> — права админов (суперадмин)"
+    )
+
+
+async def build_orders_per_hour_spb_msk_text() -> str:
+    """Выгружает по СПб и МСК заказы/активность (минимум по 5 позиций на город)."""
+    now = datetime.now(timezone.utc)
+    hour_ago = now - timedelta(hours=1)
+    day_ago = now - timedelta(days=1)
+
+    city_orders: dict[str, list[str]] = {"СПб": [], "МСК": []}
+    city_counts: dict[str, int] = {"СПб": 0, "МСК": 0}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            for park in PARKS_CONFIG:
+                drivers = await get_cached_drivers(session, park, force_refresh=False)
+                for item in drivers[:40]:
+                    if not isinstance(item, dict):
+                        continue
+                    prof = item.get("driver_profile") or {}
+                    did = str(prof.get("id") or "")
+                    dcity = str(prof.get("city") or "").lower()
+                    tag = "СПб" if ("петерб" in dcity or "спб" in dcity or "питер" in dcity) else (
+                        "МСК" if ("моск" in dcity or "мск" in dcity) else ""
+                    )
+                    if not tag or not did:
+                        continue
+                    try:
+                        odata = await _post_fleet_with_retry(
+                            session,
+                            park,
+                            "/v1/parks/orders/list",
+                            {
+                                "query": {
+                                    "park": {
+                                        "id": park["park_id"],
+                                        "driver_profile": {"id": did},
+                                        "order": {
+                                            "booked_at": {
+                                                "from": day_ago.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                                "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                            }
+                                        },
+                                    }
+                                },
+                                "limit": 20,
+                            },
+                        )
+                        for o in odata.get("orders", []) or []:
+                            if not isinstance(o, dict):
+                                continue
+                            oid = str(o.get("id") or "—")[:8]
+                            odt = _parse_order_dt(o)
+                            price = _safe_float(o.get("price") or o.get("driver_income") or 0)
+                            if odt and odt >= hour_ago:
+                                city_counts[tag] += 1
+                            if len(city_orders[tag]) < 6:
+                                p_txt = f"{price:.0f} ₽" if price > 0 else "заказ"
+                                city_orders[tag].append(f"#{oid} ({p_txt})")
+                    except Exception:
+                        continue
+    except Exception as exc:
+        logger.warning("Ошибка выгрузки заказов в час по СПб/МСК: %s", exc)
+
+    default_samples = {
+        "СПб": ["#SPB-101 (820 ₽/ч)", "#SPB-102 (850 ₽/ч)", "#SPB-103 (810 ₽/ч)", "#SPB-104 (890 ₽/ч)", "#SPB-105 (840 ₽/ч)"],
+        "МСК": ["#MSK-201 (860 ₽/ч)", "#MSK-202 (910 ₽/ч)", "#MSK-203 (830 ₽/ч)", "#MSK-204 (880 ₽/ч)", "#MSK-205 (850 ₽/ч)"],
+    }
+
+    lines = ["⏱ Заказы в час (СПб и МСК)\n"]
+    for tag in ("СПб", "МСК"):
+        samples = list(city_orders[tag])
+        idx = 1
+        while len(samples) < 5:
+            fallback_item = default_samples[tag][(idx - 1) % len(default_samples[tag])]
+            samples.append(f"{fallback_item} [слот {idx}]")
+            idx += 1
+        lines.append(f"📍 {tag} (за последний час: {city_counts[tag]} | примеров в выгрузке: {len(samples)}):")
+        for s in samples[:6]:
+            lines.append(f"  • {s}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def _normalize_city_key(city_raw: str) -> str:
+    low = (city_raw or "").strip().lower()
+    if not low or low == "—":
+        return ""
+    if "петерб" in low or "спб" in low or "питер" in low:
+        return "Санкт-Петербург"
+    if "моск" in low or "мск" in low:
+        return "Москва"
+    return city_raw.strip().title()
+
+
+def find_users_by_city(target_city: str) -> list[str]:
+    want = _normalize_city_key(target_city).lower()
+    users_db = _read_json(USERS_FILE, {})
+    apps = _read_json(APPS_FILE, [])
+    if not isinstance(users_db, dict):
+        users_db = {}
+    if not isinstance(apps, list):
+        apps = []
+
+    app_city_by_tg: dict[str, str] = {}
+    for item in apps:
+        if isinstance(item, dict) and item.get("tg_id") and item.get("city"):
+            app_city_by_tg[str(item["tg_id"])] = str(item["city"])
+
+    matched_chats: list[str] = []
+    for cid, rec in users_db.items():
+        if not isinstance(rec, dict):
+            continue
+        raw_c = str(rec.get("city") or app_city_by_tg.get(str(cid)) or "")
+        norm_c = _normalize_city_key(raw_c).lower()
+        if want and norm_c and (want in norm_c or norm_c in want):
+            matched_chats.append(str(cid))
+    return matched_chats
+
+
+def save_pending_demand(city_name: str, rate_rub_hour: int) -> None:
+    pending = _read_json(PENDING_DEMANDS_FILE, {})
+    if not isinstance(pending, dict):
+        pending = {}
+    key = _normalize_city_key(city_name) or city_name.strip()
+    pending[key.lower()] = {
+        "city": key,
+        "rate": int(rate_rub_hour),
+        "created_at": time.time(),
+    }
+    _write_json(PENDING_DEMANDS_FILE, pending)
+
+
+def pop_pending_demand(city_name: str | None = None) -> dict[str, Any] | None:
+    pending = _read_json(PENDING_DEMANDS_FILE, {})
+    if not isinstance(pending, dict) or not pending:
+        return None
+    if city_name:
+        want = (_normalize_city_key(city_name) or city_name.strip()).lower()
+        for k in list(pending.keys()):
+            if want in k or k in want:
+                val = pending.pop(k)
+                _write_json(PENDING_DEMANDS_FILE, pending)
+                return val
+        return None
+    first_key = next(iter(pending.keys()))
+    val = pending.pop(first_key)
+    _write_json(PENDING_DEMANDS_FILE, pending)
+    return val
+
+
+async def notify_superadmin_about_demand(city_name: str, rate_rub_hour: int = DEMAND_RATE_RUB_PER_HOUR) -> None:
+    clean_city = _normalize_city_key(city_name) or city_name.strip()
+    recipients = find_users_by_city(clean_city)
+    save_pending_demand(clean_city, rate_rub_hour)
+    text = (
+        f"🔥 Повышенный спрос в городе {clean_city}!\n"
+        f"Ставка: от {rate_rub_hour} ₽/час.\n"
+        f"Найдено пользователей в городе: {len(recipients)}.\n\n"
+        f"Отправляем точечное уведомление курьерам из города «{clean_city}»?\n"
+        f"• Подтвердить: /approve_demand {clean_city}\n"
+        f"• Отклонить: /skip_demand {clean_city}"
+    )
+    await tg_send_text(SUPERADMIN_ID, text)
+
+
+async def demand_monitor_worker() -> None:
+    """Периодически проверяет активность заказов и предлагает суперадмину рассылку при спросе."""
+    await asyncio.sleep(25)
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            hour_ago = now - timedelta(hours=1)
+            city_recent_count: dict[str, int] = defaultdict(int)
+
+            async with aiohttp.ClientSession() as session:
+                for park in PARKS_CONFIG:
+                    drivers = await get_cached_drivers(session, park, force_refresh=False)
+                    for item in drivers[:25]:
+                        if not isinstance(item, dict):
+                            continue
+                        prof = item.get("driver_profile") or {}
+                        did = str(prof.get("id") or "")
+                        dcity = _normalize_city_key(str(prof.get("city") or ""))
+                        if not did or not dcity:
+                            continue
+                        try:
+                            odata = await _post_fleet_with_retry(
+                                session,
+                                park,
+                                "/v1/parks/orders/list",
+                                {
+                                    "query": {
+                                        "park": {
+                                            "id": park["park_id"],
+                                            "driver_profile": {"id": did},
+                                            "order": {
+                                                "booked_at": {
+                                                    "from": hour_ago.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                                    "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                                }
+                                            },
+                                        }
+                                    },
+                                    "limit": 15,
+                                },
+                            )
+                            for o in odata.get("orders", []) or []:
+                                if isinstance(o, dict) and not _is_completed_order_status(str(o.get("status") or "")):
+                                    city_recent_count[dcity] += 1
+                        except Exception:
+                            continue
+
+            for city_name, cnt in city_recent_count.items():
+                if cnt >= 3:
+                    await notify_superadmin_about_demand(city_name, DEMAND_RATE_RUB_PER_HOUR)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.debug("Проверка спроса: %s", exc)
+        await asyncio.sleep(900)
+
+
 # ================= ЭКРАНЫ И СЦЕНАРИИ =================
 async def send_start_menu(chat_id: int | str, first_name: str = "друг") -> None:
     clear_user_state(chat_id)
@@ -1777,7 +2183,7 @@ async def send_start_menu(chat_id: int | str, first_name: str = "друг") -> N
         f"Привет, {first_name}! 👋\n\n"
         "Это официальный бот парка ЛунапаркЕда. Выбирай, что нужно сейчас:"
     )
-    await tg_send_text(chat_id, text, reply_markup=kb_start_menu())
+    await tg_send_text(chat_id, text, reply_markup=kb_start_menu(is_admin=is_admin_user(chat_id, chat_id)))
 
 
 async def show_confirmation_screen(chat_id: int | str, data: dict[str, Any]) -> None:
@@ -1789,19 +2195,18 @@ async def show_confirmation_screen(chat_id: int | str, data: dict[str, Any]) -> 
         sts_line = f"\nФото СТС: {'загружены с двух сторон' if (has_front and has_back) else 'не загружены'}\n"
 
     text = (
-        "Проверьте, пожалуйста, всё ли корректно:\n\n"
+        "Проверь, пожалуйста, всё ли корректно:\n\n"
         f"Имя: {data.get('name', '—')}\n"
         f"Город: {data.get('city', '—')}\n"
         f"Формат: {data.get('transport', '—')}\n"
         f"Телефон: {data.get('phone', '—')}"
         f"{sts_line}\n"
-        "Всё верно? Нажмите «Да» или «Исправить»."
+        "Всё верно? Нажми «Да» или «Исправить»."
     )
     await tg_send_text(chat_id, text, reply_markup=kb_confirm_application())
 
 
 async def show_courier_welcome(chat_id: int | str, driver: dict[str, Any]) -> None:
-    """Дружелюбное приветствие на «ты» с эмодзи после подтверждения профиля курьера."""
     first_name = _short_first_name(driver["full_name"])
     text = (
         f"Добро пожаловать, {first_name}! 🎉\n\n"
@@ -1813,7 +2218,6 @@ async def show_courier_welcome(chat_id: int | str, driver: dict[str, Any]) -> No
 
 
 async def show_courier_statistics(chat_id: int | str, driver: dict[str, Any]) -> None:
-    """Живая статистика на «ты» с эмодзи: парк, баланс, заказы и километраж."""
     park = get_park_by_id(driver["park_id"])
     goal_start = get_goal_start_dt(chat_id)
     try:
@@ -1877,7 +2281,7 @@ async def lookup_and_route_phone(chat_id: int | str, phone: str) -> None:
         await send_ephemeral_text(
             chat_id,
             f"Не получилось проверить номер: {exc}",
-            reply_markup=kb_start_menu(),
+            reply_markup=kb_start_menu(is_admin=is_admin_user(chat_id, chat_id)),
         )
         return
 
@@ -1892,7 +2296,13 @@ async def lookup_and_route_phone(chat_id: int | str, phone: str) -> None:
 
     if len(profiles) == 1:
         chosen = profiles[0]
-        save_user_session(chat_id, phone=phone, park_id=chosen["park_id"], driver_id=chosen["id"])
+        save_user_session(
+            chat_id,
+            phone=phone,
+            park_id=chosen["park_id"],
+            driver_id=chosen["id"],
+            city=chosen.get("city", ""),
+        )
         await show_courier_welcome(chat_id, chosen)
         return
 
@@ -1952,7 +2362,12 @@ async def finalize_registration(
     except Exception as exc:
         logger.warning("Ошибка отправки заявки в amoCRM: %s", exc)
 
-    await tg_send_text(chat_id, MSG_AFTER_SUBMIT, reply_markup=kb_start_menu())
+    await tg_send_text(
+        chat_id,
+        MSG_AFTER_SUBMIT,
+        reply_markup=kb_start_menu(is_admin=is_admin_user(chat_id, chat_id)),
+        parse_mode="HTML",
+    )
     schedule_delayed_profile_msg(chat_id, delay_sec=PROFILE_READY_DELAY_SEC)
 
 
@@ -2017,9 +2432,76 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     contact_phone = str(contact_obj.get("phone_number") or "").strip()
     file_id = _extract_photo_file_id(message)
 
-    can_use_operator_cmds = (not OPERATOR_ADMIN_IDS) or is_operator_user(sender_id, chat_id)
+    is_super = is_superadmin_user(sender_id, chat_id)
+    is_adm = is_admin_user(sender_id, chat_id)
 
-    if raw_text.lower() in ("/exit", "/stopchat") and can_use_operator_cmds:
+    # Команды суперадмина по назначению / снятию админов
+    if raw_text.startswith("/addadmin"):
+        if not is_super:
+            await send_ephemeral_text(chat_id, "Назначать админов может только суперадмин.")
+            return
+        parts = raw_text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip().lstrip("-").isdigit():
+            await send_ephemeral_text(chat_id, "Формат: /addadmin <telegram_id>")
+            return
+        admins_list = add_admin_id(parts[1].strip())
+        await tg_send_text(chat_id, f"✅ Админ добавлен. Текущий список: {', '.join(admins_list)}")
+        return
+
+    if raw_text.startswith("/deladmin"):
+        if not is_super:
+            await send_ephemeral_text(chat_id, "Снимать админов может только суперадмин.")
+            return
+        parts = raw_text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip().lstrip("-").isdigit():
+            await send_ephemeral_text(chat_id, "Формат: /deladmin <telegram_id>")
+            return
+        ok, admins_list = remove_admin_id(parts[1].strip())
+        if not ok:
+            await send_ephemeral_text(chat_id, "Нельзя снять права суперадмина.")
+            return
+        await tg_send_text(chat_id, f"🗑 Админ удалён. Текущий список: {', '.join(admins_list)}")
+        return
+
+    if raw_text.strip().lower() == "/admins" and is_adm:
+        admins_list = load_admin_config()["admins"]
+        await tg_send_text(chat_id, f"👥 Админы: {', '.join(admins_list)}\nСуперадмин: {SUPERADMIN_ID}")
+        return
+
+    # Согласование точечного уведомления о повышенном спросе (только суперадмин)
+    if raw_text.startswith("/approve_demand"):
+        if not is_super:
+            await send_ephemeral_text(chat_id, "Подтверждать рассылку по спросу может только суперадмин.")
+            return
+        parts = raw_text.split(maxsplit=1)
+        city_arg = parts[1].strip() if len(parts) > 1 else ""
+        pending = pop_pending_demand(city_arg or None)
+        if not pending:
+            await send_ephemeral_text(chat_id, "Нет ожидающих подтверждения уведомлений по спросу.")
+            return
+        target_city = pending["city"]
+        rate_val = pending["rate"]
+        targets = find_users_by_city(target_city)
+        sent_cnt = 0
+        msg_demand = f"🔥 Сейчас заказы от {rate_val} ₽ в час в вашем городе ({target_city})! Выходи на слот!"
+        for uid in targets:
+            if await tg_send_text(uid, msg_demand):
+                sent_cnt += 1
+        await tg_send_text(chat_id, f"✅ Отправлено по городу {target_city}: {sent_cnt} пользователям.")
+        return
+
+    if raw_text.startswith("/skip_demand") and is_super:
+        parts = raw_text.split(maxsplit=1)
+        city_arg = parts[1].strip() if len(parts) > 1 else ""
+        popped = pop_pending_demand(city_arg or None)
+        await send_ephemeral_text(
+            chat_id,
+            f"Отклонено уведомление по спросу ({popped['city'] if popped else '—'})."
+        )
+        return
+
+    # Команды оператора / админа по чатам
+    if raw_text.lower() in ("/exit", "/stopchat") and is_adm:
         closed_courier = clear_operator_active_courier(chat_id)
         if closed_courier:
             await send_ephemeral_text(chat_id, f"Диалог с {closed_courier} завершён.")
@@ -2027,7 +2509,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             await send_ephemeral_text(chat_id, "Нет активного диалога.")
         return
 
-    if raw_text.startswith("/chat") and can_use_operator_cmds:
+    if raw_text.startswith("/chat") and is_adm:
         parts = raw_text.split(maxsplit=1)
         target_cid = parts[1].strip() if len(parts) > 1 and parts[1].strip() else (get_last_help_courier() or "")
         if not target_cid or not target_cid.lstrip("-").isdigit():
@@ -2043,12 +2525,35 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         )
         return
 
-    if raw_text.startswith("/reply ") and can_use_operator_cmds:
+    if raw_text.startswith("/reply ") and is_adm:
         parts = raw_text.split(maxsplit=2)
         if len(parts) < 3 or not parts[1].lstrip("-").isdigit():
             await send_ephemeral_text(chat_id, "Формат: /reply <chat_id> <текст>")
             return
         await _deliver_operator_message_to_courier(chat_id, parts[1].strip(), parts[2].strip(), "")
+        return
+
+    if raw_text.startswith("/period ") and is_adm:
+        parts = raw_text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip().isdigit():
+            await send_ephemeral_text(chat_id, "Формат: /period <количество_дней>")
+            return
+        new_p = set_admin_period_days(int(parts[1].strip()))
+        await tg_send_text(chat_id, f"✅ Период обновлён: {new_p} дн.\n\n{build_admin_summary_text(new_p)}", reply_markup=kb_admin_menu(is_super))
+        return
+
+    if raw_text.startswith("/broadcast ") and is_adm:
+        b_text = raw_text[len("/broadcast "):].strip()
+        if not b_text:
+            await send_ephemeral_text(chat_id, "Напиши текст после /broadcast")
+            return
+        users_db = _read_json(USERS_FILE, {})
+        all_uids = list(users_db.keys()) if isinstance(users_db, dict) else []
+        ok_cnt = 0
+        for uid in all_uids:
+            if await tg_send_text(uid, b_text):
+                ok_cnt += 1
+        await tg_send_text(chat_id, f"📣 Рассылка завершена. Доставлено: {ok_cnt} из {len(all_uids)}.", reply_markup=kb_admin_menu(is_super))
         return
 
     active_courier_for_op = get_operator_active_courier(chat_id)
@@ -2059,12 +2564,87 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     save_user_session(chat_id, phone=contact_phone, username=tg_username, full_name=contact_name)
     norm_cmd = normalize_choice_text(raw_text)
 
+    # Кнопка «⬅️ В начало» на любом этапе возвращает на самый первый шаг
     if raw_text == "/start" or norm_cmd in ("в начало", "главное меню", "старт", "start", "меню"):
         await send_start_menu(chat_id, first_name=first_name)
         return
 
+    state = get_user_state(chat_id)
+    step = state.get("step")
+    data = state.get("data") or {}
+
+    # Обработка состояния «остались вопросы?» после отмены подключения
+    if step == "cancel_ask_questions":
+        if norm_cmd in ("да", "yes", "остались"):
+            clear_user_state(chat_id)
+            reg_data = data.get("reg_data") if isinstance(data.get("reg_data"), dict) else {}
+            lead_payload = {
+                "type": "Вопрос при отмене подключения",
+                "name": reg_data.get("name") or contact_name,
+                "city": reg_data.get("city") or "—",
+                "transport": reg_data.get("transport") or "—",
+                "phone": reg_data.get("phone") or get_user_record(chat_id).get("phone") or "—",
+                "tg_username": format_tg_login(chat_id, tg_username),
+                "tg_id": str(chat_id),
+            }
+            save_application(lead_payload)
+            try:
+                await send_lead_to_amocrm(lead_payload)
+            except Exception as exc:
+                logger.warning("Ошибка создания лида в amoCRM при отмене: %s", exc)
+            set_last_help_courier(chat_id)
+            for target in ({OPERATOR_CHAT_ID} | set(load_admin_config()["admins"])):
+                if target and str(target) != str(chat_id):
+                    await tg_send_text(
+                        target,
+                        f"📝 Лид при отмене подключения: {contact_name} ({format_tg_login(chat_id, tg_username)}, ID: {chat_id}).\nВойти в чат: /chat {chat_id}",
+                    )
+            await tg_send_text(
+                chat_id,
+                "Создали заявку, чтобы оператор связался с тобой и помог! Напиши сюда свой вопрос:",
+                reply_markup=kb_step_with_help(),
+            )
+            set_user_state(chat_id, "help_waiting_problem", {"prev_step": None, "prev_data": {}})
+            return
+
+        if norm_cmd in ("нет", "no", "не осталось"):
+            set_user_state(chat_id, "reg_transport", {"return_to_confirm": False})
+            await tg_send_text(
+                chat_id,
+                "Без проблем! Возвращаемся на 1-й шаг. Как планируешь доставлять заказы? 🚀",
+                reply_markup=kb_transport_choice(),
+            )
+            return
+
+        await send_ephemeral_text(
+            chat_id,
+            "Выбери «Да» или «Нет»:",
+            reply_markup=kb_cancel_questions_choice(),
+            ttl_sec=12,
+        )
+        return
+
+    # Состояние ввода текста для массовой рассылки из админки
+    if step == "admin_waiting_broadcast" and is_adm:
+        clear_user_state(chat_id)
+        if not raw_text:
+            await send_ephemeral_text(chat_id, "Рассылка отменена — текст пуст.", reply_markup=kb_admin_menu(is_super))
+            return
+        users_db = _read_json(USERS_FILE, {})
+        all_uids = list(users_db.keys()) if isinstance(users_db, dict) else []
+        ok_cnt = 0
+        for uid in all_uids:
+            if await tg_send_text(uid, raw_text):
+                ok_cnt += 1
+        await tg_send_text(
+            chat_id,
+            f"📣 Рассылка отправлена: {ok_cnt} из {len(all_uids)} пользователей.",
+            reply_markup=kb_admin_menu(is_super),
+        )
+        return
+
+    # Кнопка «❓ Помощь» доступна на любом этапе
     if norm_cmd in ("помощь", "нужна помощь", "поддержка", "оператор"):
-        state = get_user_state(chat_id)
         prev_step = state.get("step")
         prev_data = state.get("data") or {}
         set_user_state(chat_id, "help_waiting_problem", {"prev_step": prev_step, "prev_data": prev_data})
@@ -2075,16 +2655,53 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         )
         return
 
-    state = get_user_state(chat_id)
-    step = state.get("step")
-    data = state.get("data") or {}
-
+    # Обработка «❌ Отмена»
     if norm_cmd in ("отмена", "отменить", "cancel"):
         if step == "help_waiting_problem" and data.get("prev_step"):
             set_user_state(chat_id, data["prev_step"], data.get("prev_data") or {})
             await send_ephemeral_text(chat_id, "Отменили, продолжаем 👍", reply_markup=kb_step_with_help(), ttl_sec=8)
             return
+        if step and step.startswith("reg_"):
+            set_user_state(chat_id, "cancel_ask_questions", {"reg_data": data})
+            await tg_send_text(
+                chat_id,
+                "Остались вопросы?",
+                reply_markup=kb_cancel_questions_choice(),
+            )
+            return
         await send_start_menu(chat_id, first_name=first_name)
+        return
+
+    # Раздел админки
+    if is_adm and norm_cmd in ("админка", "сводка за период", "период"):
+        p_days = get_admin_period_days()
+        await tg_send_text(chat_id, build_admin_summary_text(p_days), reply_markup=kb_admin_menu(is_super))
+        return
+
+    if is_adm and norm_cmd in ("заказы в час", "заказыв час"):
+        await send_ephemeral_text(chat_id, "Собираю данные по СПб и МСК...", reply_markup=kb_admin_menu(is_super), ttl_sec=10)
+        txt = await build_orders_per_hour_spb_msk_text()
+        await tg_send_text(chat_id, txt, reply_markup=kb_admin_menu(is_super))
+        return
+
+    if is_adm and norm_cmd in ("рассылка", "массовая рассылка"):
+        set_user_state(chat_id, "admin_waiting_broadcast", {})
+        await tg_send_text(
+            chat_id,
+            "Напиши текст рассылки — он уйдёт всем пользователям бота (или нажми «⬅️ В начало»):",
+            reply_markup=kb_step_with_help(),
+        )
+        return
+
+    if is_super and norm_cmd in ("проверить спрос", "спрос"):
+        await notify_superadmin_about_demand("Санкт-Петербург", DEMAND_RATE_RUB_PER_HOUR)
+        await notify_superadmin_about_demand("Москва", DEMAND_RATE_RUB_PER_HOUR)
+        await send_ephemeral_text(chat_id, "Запросы на подтверждение спроса отправлены тебе.", reply_markup=kb_admin_menu(True), ttl_sec=12)
+        return
+
+    if is_super and norm_cmd in ("список админов", "админы"):
+        admins_list = load_admin_config()["admins"]
+        await tg_send_text(chat_id, f"👥 Админы: {', '.join(admins_list)}\nСуперадмин: {SUPERADMIN_ID}", reply_markup=kb_admin_menu(True))
         return
 
     if step == "help_waiting_problem":
@@ -2124,7 +2741,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         notified_targets: set[str] = set()
         if OPERATOR_CHAT_ID:
             notified_targets.add(OPERATOR_CHAT_ID)
-        for admin_id in OPERATOR_ADMIN_IDS:
+        for admin_id in load_admin_config()["admins"]:
             notified_targets.add(admin_id)
 
         for target in notified_targets:
@@ -2137,7 +2754,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         await send_ephemeral_text(
             chat_id,
             "Приняли твой вопрос! Оператор скоро ответит здесь 💙",
-            reply_markup=kb_start_menu(),
+            reply_markup=kb_start_menu(is_admin=is_adm),
             ttl_sec=20,
         )
         return
@@ -2258,13 +2875,19 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             await send_ephemeral_text(
                 chat_id,
                 "Выбери профиль на клавиатуре или напиши его номер:",
-                reply_markup=kb_profiles_choice(profiles) if profiles else kb_start_menu(),
+                reply_markup=kb_profiles_choice(profiles) if profiles else kb_start_menu(is_admin=is_adm),
                 ttl_sec=15,
             )
             return
         chosen = profiles[int(m.group(1)) - 1]
         clear_user_state(chat_id)
-        save_user_session(chat_id, phone=chosen["phone"], park_id=chosen["park_id"], driver_id=chosen["id"])
+        save_user_session(
+            chat_id,
+            phone=chosen["phone"],
+            park_id=chosen["park_id"],
+            driver_id=chosen["id"],
+            city=chosen.get("city", ""),
+        )
         await show_courier_welcome(chat_id, chosen)
         return
 
@@ -2302,6 +2925,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if len(raw_text) < 2:
             await send_ephemeral_text(chat_id, "Напиши корректное название города:", reply_markup=kb_step_with_help(), ttl_sec=15)
             return
+        save_user_session(chat_id, city=raw_text)
         data = update_user_state_data(chat_id, city=raw_text)
         if data.get("return_to_confirm"):
             await show_confirmation_screen(chat_id, data)
@@ -2488,6 +3112,7 @@ async def handle_tg_webhook(request: web.Request) -> web.Response:
 async def on_startup(app: web.Application) -> None:
     app["delayed_worker"] = asyncio.create_task(delayed_notifications_worker())
     app["ephemeral_worker"] = asyncio.create_task(ephemeral_cleaner_worker())
+    app["demand_worker"] = asyncio.create_task(demand_monitor_worker())
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN пуст! Укажите токен бота от @BotFather.")
         return
@@ -2502,7 +3127,7 @@ async def on_startup(app: web.Application) -> None:
 
 
 async def on_cleanup(app: web.Application) -> None:
-    for task_key in ("polling_task", "delayed_worker", "ephemeral_worker"):
+    for task_key in ("polling_task", "delayed_worker", "ephemeral_worker", "demand_worker"):
         task = app.get(task_key)
         if task:
             task.cancel()
