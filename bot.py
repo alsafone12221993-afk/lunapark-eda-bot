@@ -17,6 +17,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9247740629:AAGDDIXtFOfRj66
 TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
+# Время жизни исчезающих сообщений (в секундах)
+EPHEMERAL_TTL_SEC = int(os.getenv("EPHEMERAL_TTL_SEC", "25"))
+
 # Telegram ID операторов / администраторов
 _raw_admins = os.getenv("OPERATOR_ADMIN_IDS", "673430213").strip()
 OPERATOR_ADMIN_IDS: set[str] = {
@@ -64,6 +67,7 @@ CLIENT_LEADS_FILE = "client_leads.json"
 STATES_FILE = "user_states.json"
 DELAYED_TASKS_FILE = "delayed_notifications.json"
 LIVE_CHATS_FILE = "live_chats.json"
+EPHEMERAL_MSGS_FILE = "ephemeral_messages.json"
 
 FLEET_API_URL = "https://fleet-api.taxi.yandex.net"
 
@@ -78,6 +82,9 @@ PAGE_PAUSE_SEC = 0.5
 
 DRIVER_STATS_CACHE: dict[str, dict[str, Any]] = {}
 DRIVER_STATS_TTL_SEC = 180
+
+DRIVER_FINES_CACHE: dict[str, dict[str, Any]] = {}
+DRIVER_FINES_TTL_SEC = 180
 
 PENDING_PROFILES: dict[str, list[dict[str, Any]]] = {}
 _FIELDS_CATALOG_CACHE: dict[str, list[dict[str, Any]]] = {}
@@ -108,7 +115,6 @@ MSG_PROFILE_CREATED_10M = (
     "Условия работы в парке ЛунапаркЕда:\n"
     "— Комиссия парка: 3%\n"
     "— Бонус от парка: +500 ₽ за первые 5 заказов в течение 14 дней\n"
-    "— Бонус для новых курьеров Яндекс Еды: +13 000 ₽ за 100 заказов в первые 20 дней с момента регистрации\n\n"
     "Как выводить деньги:\n"
     "Вывод моментальный через приложение JumpTaxi (от 100 ₽):\n"
     "— На карты Т-Банка от 2 000 ₽ — без комиссии (0%)\n"
@@ -118,9 +124,21 @@ MSG_PROFILE_CREATED_10M = (
 
 
 # ================= КЛАВИАТУРЫ TELEGRAM (НА КАЖДОМ ЭТАПЕ ЕСТЬ «❓ Помощь») =================
-def _reply_kb(rows: list[list[str]], one_time: bool = False) -> dict[str, Any]:
+def _reply_kb(
+    rows: list[list[str | dict[str, Any]]],
+    one_time: bool = False,
+) -> dict[str, Any]:
+    keyboard_rows: list[list[dict[str, Any]]] = []
+    for row in rows:
+        built_row: list[dict[str, Any]] = []
+        for btn in row:
+            if isinstance(btn, dict):
+                built_row.append(btn)
+            else:
+                built_row.append({"text": str(btn)})
+        keyboard_rows.append(built_row)
     return {
-        "keyboard": [[{"text": btn} for btn in row] for row in rows],
+        "keyboard": keyboard_rows,
         "resize_keyboard": True,
         "one_time_keyboard": one_time,
     }
@@ -147,6 +165,13 @@ def kb_step_with_help() -> dict[str, Any]:
     ])
 
 
+def kb_courier_phone_auth() -> dict[str, Any]:
+    return _reply_kb([
+        [{"text": "📱 Отправить номер профиля", "request_contact": True}],
+        ["❓ Помощь", "❌ Отмена"],
+    ])
+
+
 def kb_confirm_application() -> dict[str, Any]:
     return _reply_kb([
         ["Да", "Исправить"],
@@ -155,7 +180,7 @@ def kb_confirm_application() -> dict[str, Any]:
 
 
 def kb_edit_field_choice(data: dict[str, Any]) -> dict[str, Any]:
-    rows: list[list[str]] = [
+    rows: list[list[str | dict[str, Any]]] = [
         ["Изменить формат", "Изменить город"],
         ["Изменить имя", "Изменить телефон"],
     ]
@@ -169,13 +194,14 @@ def kb_edit_field_choice(data: dict[str, Any]) -> dict[str, Any]:
 def kb_courier_cabinet() -> dict[str, Any]:
     return _reply_kb([
         ["📊 Моя статистика", "🤔 Я на линии?"],
-        ["🎁 Цель", "❓ Помощь"],
-        ["🔄 Сменить номер", "⬅️ В начало"],
+        ["🎁 Цель", "⚖️ Корректировки"],
+        ["❓ Помощь", "🔄 Сменить номер"],
+        ["⬅️ В начало"],
     ])
 
 
 def kb_profiles_choice(profiles: list[dict[str, Any]]) -> dict[str, Any]:
-    rows: list[list[str]] = []
+    rows: list[list[str | dict[str, Any]]] = []
     for idx, prof in enumerate(profiles[:10]):
         rows.append([f"{idx + 1}. {prof['park_name']}"])
     rows.append(["Хочу ввести другой номер", "❓ Помощь"])
@@ -469,7 +495,7 @@ def save_client_lead(chat_id: int | str, lead_id: int) -> None:
     _write_json(CLIENT_LEADS_FILE, data)
 
 
-# ================= TELEGRAM BOT API =================
+# ================= TELEGRAM BOT API + ИСЧЕЗАЮЩИЕ СООБЩЕНИЯ =================
 async def tg_api(session: aiohttp.ClientSession, method: str, payload: dict[str, Any]) -> dict[str, Any]:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     async with session.post(url, json=payload, timeout=25) as resp:
@@ -483,10 +509,10 @@ async def tg_send_text(
     chat_id: int | str,
     text: str,
     reply_markup: dict[str, Any] | None = None,
-) -> bool:
+) -> int | None:
     if not TELEGRAM_BOT_TOKEN:
         logger.error("Не задан TELEGRAM_BOT_TOKEN")
-        return False
+        return None
     payload: dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
@@ -496,10 +522,87 @@ async def tg_send_text(
     try:
         async with aiohttp.ClientSession() as session:
             res = await tg_api(session, "sendMessage", payload)
-            return bool(res.get("ok"))
+            if not res.get("ok"):
+                return None
+            msg = res.get("result") or {}
+            mid = msg.get("message_id")
+            return int(mid) if isinstance(mid, int) else None
     except Exception as exc:
         logger.exception("Ошибка отправки сообщения в Telegram: %s", exc)
+        return None
+
+
+async def tg_delete_message(chat_id: int | str, message_id: int) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not message_id:
         return False
+    try:
+        async with aiohttp.ClientSession() as session:
+            res = await tg_api(session, "deleteMessage", {"chat_id": chat_id, "message_id": int(message_id)})
+            return bool(res.get("ok"))
+    except Exception:
+        return False
+
+
+def schedule_ephemeral_delete(
+    chat_id: int | str,
+    message_id: int | None,
+    ttl_sec: int = EPHEMERAL_TTL_SEC,
+) -> None:
+    if not message_id:
+        return
+    items = _read_json(EPHEMERAL_MSGS_FILE, [])
+    if not isinstance(items, list):
+        items = []
+    items.append({
+        "chat_id": str(chat_id),
+        "message_id": int(message_id),
+        "delete_at": time.time() + max(3, int(ttl_sec)),
+    })
+    _write_json(EPHEMERAL_MSGS_FILE, items)
+
+
+async def send_ephemeral_text(
+    chat_id: int | str,
+    text: str,
+    reply_markup: dict[str, Any] | None = None,
+    ttl_sec: int = EPHEMERAL_TTL_SEC,
+) -> int | None:
+    mid = await tg_send_text(chat_id, text, reply_markup=reply_markup)
+    if mid:
+        async with _FILE_LOCKS["ephemeral_msgs"]:
+            schedule_ephemeral_delete(chat_id, mid, ttl_sec=ttl_sec)
+    return mid
+
+
+async def ephemeral_cleaner_worker() -> None:
+    logger.info("Запущен воркер автоудаления исчезающих сообщений (TTL=%s сек)", EPHEMERAL_TTL_SEC)
+    while True:
+        try:
+            async with _FILE_LOCKS["ephemeral_msgs"]:
+                items = _read_json(EPHEMERAL_MSGS_FILE, [])
+                if isinstance(items, list) and items:
+                    now = time.time()
+                    remaining: list[dict[str, Any]] = []
+                    changed = False
+                    for item in items:
+                        if not isinstance(item, dict):
+                            changed = True
+                            continue
+                        if now >= float(item.get("delete_at", 0)):
+                            cid = item.get("chat_id")
+                            mid = item.get("message_id")
+                            if cid and mid:
+                                await tg_delete_message(cid, int(mid))
+                            changed = True
+                        else:
+                            remaining.append(item)
+                    if changed:
+                        _write_json(EPHEMERAL_MSGS_FILE, remaining)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.exception("Ошибка в воркере исчезающих сообщений: %s", exc)
+        await asyncio.sleep(3)
 
 
 async def tg_send_photo(
@@ -576,8 +679,8 @@ async def delayed_notifications_worker() -> None:
                         if now >= float(task.get("send_at", 0)):
                             cid = str(task.get("chat_id") or "")
                             txt = str(task.get("text") or MSG_PROFILE_CREATED_10M)
-                            ok = await tg_send_text(cid, txt, reply_markup=kb_start_menu())
-                            if ok:
+                            mid = await tg_send_text(cid, txt, reply_markup=kb_start_menu())
+                            if mid:
                                 changed = True
                             else:
                                 task["send_at"] = now + 30
@@ -1172,7 +1275,7 @@ async def send_help_to_amocrm(
             return False, str(exc)
 
 
-# ================= YANDEX FLEET API (КАБИНЕТ КУРЬЕРА) =================
+# ================= YANDEX FLEET API (КАБИНЕТ КУРЬЕРА, КИЛОМЕТРАЖ И ШТРАФЫ) =================
 def _safe_float(val: Any) -> float:
     if val is None:
         return 0.0
@@ -1188,6 +1291,41 @@ def _safe_float(val: Any) -> float:
         return float(cleaned)
     except ValueError:
         return 0.0
+
+
+def _extract_order_distance_km(order: dict[str, Any]) -> float:
+    """Извлекает дистанцию заказа в километрах (если в API передано в метрах — делит на 1000)."""
+    for key in ("distance_km", "mileage_km", "route_length_km"):
+        if key in order and order[key] is not None:
+            v = _safe_float(order[key])
+            if v > 0:
+                return v
+
+    for key in ("distance", "mileage", "route_length", "paid_distance", "total_distance"):
+        if key in order and order[key] is not None:
+            raw_v = order[key]
+            if isinstance(raw_v, dict):
+                if raw_v.get("km") is not None:
+                    v = _safe_float(raw_v["km"])
+                    if v > 0:
+                        return v
+                if raw_v.get("meters") is not None:
+                    v = _safe_float(raw_v["meters"]) / 1000.0
+                    if v > 0:
+                        return v
+            v = _safe_float(raw_v)
+            if v > 0:
+                # Если число явно в метрах (например >= 100), переводим в км
+                return v / 1000.0 if v >= 100 else v
+    return 0.0
+
+
+def _short_first_name(full_name: str) -> str:
+    parts = [p for p in (full_name or "").strip().split() if p]
+    if len(parts) >= 2:
+        # Если формат «Фамилия Имя», берём второе слово, иначе первое
+        return parts[1]
+    return parts[0] if parts else "Курьер"
 
 
 def get_park_by_id(park_id: str) -> dict[str, str]:
@@ -1428,12 +1566,14 @@ async def _get_driver_orders_stats(
                 "within_14d_window": now <= reg_end,
                 "active_orders": [],
                 "earnings_7d": 0.0,
+                "distance_km_7d": 0.0,
             }
 
         completed_7d = 0
         completed_14d_from_reg = 0
         active_orders: list[str] = []
         earnings_total = 0.0
+        distance_km_7d = 0.0
 
         for order in data.get("orders", []):
             if not isinstance(order, dict):
@@ -1441,12 +1581,14 @@ async def _get_driver_orders_stats(
             status = order.get("status", "")
             order_id = order.get("id", "—")
             price = _safe_float(order.get("price") or order.get("driver_income") or order.get("cost"))
+            dist_km = _extract_order_distance_km(order)
             odt = _parse_order_dt(order)
 
             if status in ("complete", "finished", "delivered"):
                 if odt is None or odt >= week_ago:
                     completed_7d += 1
                     earnings_total += price
+                    distance_km_7d += dist_km
                 if odt is None or (registered_dt <= odt <= reg_end):
                     completed_14d_from_reg += 1
             elif status not in ("cancelled", "failed"):
@@ -1460,9 +1602,112 @@ async def _get_driver_orders_stats(
             "within_14d_window": now <= reg_end,
             "active_orders": active_orders,
             "earnings_7d": round(earnings_total, 2),
+            "distance_km_7d": round(distance_km_7d, 1),
         }
         DRIVER_STATS_CACHE[cache_key] = {"ts": now_mono, "data": result}
         return result
+
+
+async def _get_driver_fines_and_adjustments(
+    session: aiohttp.ClientSession,
+    park: dict[str, str],
+    driver_id: str,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """Выгружает штрафы и корректировки от Яндекса по водителю/курьеру за последние 30 дней."""
+    cache_key = f"fines:{park['park_id']}:{driver_id}"
+    now_mono = time.monotonic()
+    cached = DRIVER_FINES_CACHE.get(cache_key)
+    if not force_refresh and cached and (now_mono - cached["ts"]) < DRIVER_FINES_TTL_SEC:
+        return cached["data"]
+
+    now = datetime.now(timezone.utc)
+    dt_from = now - timedelta(days=30)
+
+    payload = {
+        "query": {
+            "park": {
+                "id": park["park_id"],
+                "driver_profile": {"id": driver_id},
+                "transaction": {
+                    "event_at": {
+                        "from": dt_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    }
+                },
+            }
+        },
+        "limit": 200,
+    }
+
+    endpoints = [
+        "/v2/parks/driver-profiles/transactions/list",
+        "/v1/parks/driver-profiles/transactions/list",
+    ]
+    tx_list: list[dict[str, Any]] = []
+    last_err = ""
+    loaded = False
+
+    for ep in endpoints:
+        try:
+            data = await _post_fleet_with_retry(session, park, ep, payload)
+            raw_tx = data.get("transactions") or data.get("items") or data.get("driver_transactions") or []
+            if isinstance(raw_tx, list):
+                tx_list = [x for x in raw_tx if isinstance(x, dict)]
+            loaded = True
+            break
+        except Exception as exc:
+            last_err = str(exc)
+
+    if not loaded:
+        if cached and cached.get("data", {}).get("ok"):
+            return cached["data"]
+        return {
+            "ok": False,
+            "error": last_err or "не удалось получить транзакции",
+            "fines": [],
+            "total_fines_rub": 0.0,
+        }
+
+    fines: list[dict[str, Any]] = []
+    total_fines = 0.0
+
+    for tx in tx_list:
+        cat_name = str(
+            tx.get("category_name")
+            or tx.get("category_id")
+            or tx.get("code")
+            or tx.get("type")
+            or ""
+        ).strip()
+        desc = str(tx.get("description") or tx.get("comment") or tx.get("reason") or "").strip()
+        amount = _safe_float(tx.get("amount") or tx.get("value") or tx.get("sum") or 0)
+        ev_at = str(tx.get("event_at") or tx.get("created_at") or "")[:16].replace("T", " ")
+
+        low_all = f"{cat_name} {desc}".lower()
+        is_fine = any(
+            w in low_all
+            for w in ("штраф", "fine", "penalty", "списан", "наруш", "корректиров", "удержан")
+        ) or amount < 0
+
+        if is_fine and amount != 0:
+            abs_val = abs(amount)
+            total_fines += abs_val
+            fines.append({
+                "date": ev_at or "—",
+                "title": cat_name or desc or "Корректировка / штраф Яндекса",
+                "description": desc,
+                "amount": round(abs_val, 2),
+            })
+
+    res = {
+        "ok": True,
+        "error": "",
+        "fines": fines[:15],
+        "total_fines_rub": round(total_fines, 2),
+    }
+    DRIVER_FINES_CACHE[cache_key] = {"ts": now_mono, "data": res}
+    return res
 
 
 # ================= ЭКРАНЫ И СЦЕНАРИИ =================
@@ -1510,19 +1755,23 @@ async def show_cabinet_for_profile(chat_id: int | str, driver: dict[str, Any]) -
             "within_14d_window": True,
             "active_orders": [],
             "earnings_7d": 0.0,
+            "distance_km_7d": 0.0,
         }
 
     if stats["ok"]:
         orders_block = (
             f"📦 Заказов за 7 дней: {stats['completed_7d']}\n"
+            f"🛣 Пройдено / проехано за 7 дней: {stats['distance_km_7d']:.1f} км\n"
             f"💰 Заработок за 7 дней: {stats['earnings_7d']:.2f} ₽\n"
         )
     else:
         orders_block = f"📦 Детализация заказов недоступна ({stats['error']})\n"
 
+    first_name = _short_first_name(driver["full_name"])
     text = (
-        f"✅ Добро пожаловать, {driver['full_name']}!\n"
-        f"🏢 Парк: {driver['park_name']}\n\n"
+        f"Добро пожаловать, {first_name}!\n"
+        "В боте можешь смотреть статистику поездок, цели, проверять на линии ли вы, и по вопросам писать в поддержку парка.\n\n"
+        f"🏢 Парк: {driver['park_name']}\n"
         f"💳 Баланс: {driver['balance']:.2f} ₽\n"
         f"{orders_block}\n"
         "Выберите действие на клавиатуре:"
@@ -1535,10 +1784,10 @@ async def get_saved_profile_or_redirect(chat_id: int | str) -> dict[str, Any] | 
     phone = rec.get("phone")
     if not phone:
         set_user_state(chat_id, "courier_auth_phone", {})
-        await tg_send_text(
+        await send_ephemeral_text(
             chat_id,
-            "Сначала укажите ваш номер телефона в парке:",
-            reply_markup=kb_step_with_help(),
+            "Отправьте номер профиля кнопкой ниже или введите вручную:",
+            reply_markup=kb_courier_phone_auth(),
         )
         return None
 
@@ -1556,12 +1805,17 @@ async def get_saved_profile_or_redirect(chat_id: int | str) -> dict[str, Any] | 
 
 
 async def lookup_and_route_phone(chat_id: int | str, phone: str) -> None:
-    await tg_send_text(chat_id, "⏳ Проверяю ваш номер в базе парка...", reply_markup=kb_step_with_help())
+    await send_ephemeral_text(
+        chat_id,
+        "⏳ Проверяю ваш номер в базе парка...",
+        reply_markup=kb_courier_phone_auth(),
+        ttl_sec=15,
+    )
     try:
         async with aiohttp.ClientSession() as session:
             profiles = await _find_all_profiles_by_phone(session, phone)
     except Exception as exc:
-        await tg_send_text(
+        await send_ephemeral_text(
             chat_id,
             f"⚠️ Не удалось проверить профиль в парке: {exc}",
             reply_markup=kb_start_menu(),
@@ -1569,10 +1823,9 @@ async def lookup_and_route_phone(chat_id: int | str, phone: str) -> None:
         return
 
     if not profiles:
-        await tg_send_text(
+        await send_ephemeral_text(
             chat_id,
-            f"❌ Номер {phone} не найден в базе подключённых парков.\n\n"
-            "Проверьте правильность номера или нажмите «🚀 Подключиться».",
+            f"❌ Номер {phone} не найден в базе подключённых парков. Проверьте номер или нажмите «🚀 Подключиться».",
             reply_markup=kb_start_menu(),
         )
         return
@@ -1668,15 +1921,15 @@ async def _deliver_operator_message_to_courier(
             caption=f"💬 Оператор ЛунапаркЕда:\n{raw_text}".strip(),
         )
     elif raw_text:
-        ok = await tg_send_text(courier_chat_id, f"💬 Оператор ЛунапаркЕда:\n\n{raw_text}")
+        ok = bool(await tg_send_text(courier_chat_id, f"💬 Оператор ЛунапаркЕда:\n\n{raw_text}"))
     else:
-        await tg_send_text(operator_chat_id, "Отправьте текст или фото для курьера.")
+        await send_ephemeral_text(operator_chat_id, "Отправьте текст или фото для курьера.")
         return
 
     if ok:
-        await tg_send_text(operator_chat_id, f"✅ Отправлено курьеру ({courier_chat_id}). Для выхода: /exit")
+        await send_ephemeral_text(operator_chat_id, f"✅ Отправлено курьеру ({courier_chat_id}). Для выхода: /exit")
     else:
-        await tg_send_text(operator_chat_id, f"⚠️ Не удалось доставить сообщение курьеру ({courier_chat_id}).")
+        await send_ephemeral_text(operator_chat_id, f"⚠️ Не удалось доставить сообщение курьеру ({courier_chat_id}).")
 
 
 async def handle_telegram_update(update: dict[str, Any]) -> None:
@@ -1710,17 +1963,17 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     if raw_text.lower() in ("/exit", "/stopchat") and can_use_operator_cmds:
         closed_courier = clear_operator_active_courier(chat_id)
         if closed_courier:
-            await tg_send_text(chat_id, f"🔒 Диалог с курьером ({closed_courier}) завершён.")
+            await send_ephemeral_text(chat_id, f"🔒 Диалог с курьером ({closed_courier}) завершён.")
         else:
-            await tg_send_text(chat_id, "Сейчас нет активного диалога с курьером.")
+            await send_ephemeral_text(chat_id, "Сейчас нет активного диалога с курьером.")
         return
 
-    # Команда входа в живой диалог с курьером: /chat <chat_id> (или /chat без аргументов — к последнему обратившемуся)
+    # Команда входа в живой диалог с курьером: /chat <chat_id>
     if raw_text.startswith("/chat") and can_use_operator_cmds:
         parts = raw_text.split(maxsplit=1)
         target_cid = parts[1].strip() if len(parts) > 1 and parts[1].strip() else (get_last_help_courier() or "")
         if not target_cid or not target_cid.lstrip("-").isdigit():
-            await tg_send_text(chat_id, "Укажите chat_id курьера: /chat <chat_id>")
+            await send_ephemeral_text(chat_id, "Укажите chat_id курьера: /chat <chat_id>")
             return
         set_operator_active_courier(chat_id, target_cid)
         rec = get_user_record(target_cid)
@@ -1737,7 +1990,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     if raw_text.startswith("/reply ") and can_use_operator_cmds:
         parts = raw_text.split(maxsplit=2)
         if len(parts) < 3 or not parts[1].lstrip("-").isdigit():
-            await tg_send_text(chat_id, "Формат: /reply <chat_id> <текст ответа>")
+            await send_ephemeral_text(chat_id, "Формат: /reply <chat_id> <текст ответа>")
             return
         await _deliver_operator_message_to_courier(chat_id, parts[1].strip(), parts[2].strip(), "")
         return
@@ -1775,14 +2028,14 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     if norm_cmd in ("отмена", "отменить", "cancel"):
         if step == "help_waiting_problem" and data.get("prev_step"):
             set_user_state(chat_id, data["prev_step"], data.get("prev_data") or {})
-            await tg_send_text(chat_id, "Обращение в поддержку отменено. Продолжаем.", reply_markup=kb_step_with_help())
+            await send_ephemeral_text(chat_id, "Обращение в поддержку отменено. Продолжаем.", reply_markup=kb_step_with_help())
             return
         await send_start_menu(chat_id, first_name=first_name)
         return
 
     if step == "help_waiting_problem":
         if not raw_text and not file_id:
-            await tg_send_text(
+            await send_ephemeral_text(
                 chat_id,
                 "Напишите текстом или отправьте скриншот, что случилось:",
                 reply_markup=kb_step_with_help(),
@@ -1826,10 +2079,11 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             if file_id:
                 await tg_send_photo(target, file_id, caption=f"Вложение от {contact_name} (ID: {chat_id})")
 
-        await tg_send_text(
+        await send_ephemeral_text(
             chat_id,
             "Обращение принято! Оператор скоро ответит вам прямо здесь.",
             reply_markup=kb_start_menu(),
+            ttl_sec=40,
         )
         return
 
@@ -1852,21 +2106,13 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         )
         return
 
-    if norm_cmd in ("уже курьер", "уже курьер парка", "кабинет", "мой кабинет"):
+    if norm_cmd in ("уже курьер", "уже курьер парка", "кабинет", "мой кабинет", "сменить номер", "изменить номер аккаунта"):
         set_user_state(chat_id, "courier_auth_phone", {})
-        await tg_send_text(
+        await send_ephemeral_text(
             chat_id,
-            "Введите номер телефона, привязанный к аккаунту в парке:",
-            reply_markup=kb_step_with_help(),
-        )
-        return
-
-    if norm_cmd in ("сменить номер", "изменить номер аккаунта"):
-        set_user_state(chat_id, "courier_auth_phone", {})
-        await tg_send_text(
-            chat_id,
-            "Отправьте номер телефона для входа в кабинет курьера:",
-            reply_markup=kb_step_with_help(),
+            "Отправьте ваш номер профиля кнопкой «📱 Отправить номер профиля» или введите его текстом (например, +7 999 123-45-67):",
+            reply_markup=kb_courier_phone_auth(),
+            ttl_sec=45,
         )
         return
 
@@ -1886,7 +2132,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             async with aiohttp.ClientSession() as session:
                 stats = await _get_driver_orders_stats(session, park, driver["id"], registered_dt=reg_dt)
         except Exception as exc:
-            await tg_send_text(chat_id, f"⚠️ Ошибка проверки линии: {exc}", reply_markup=kb_courier_cabinet())
+            await send_ephemeral_text(chat_id, f"⚠️ Ошибка проверки линии: {exc}", reply_markup=kb_courier_cabinet())
             return
 
         line_map = {
@@ -1898,7 +2144,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         active_info = "\n".join(f"• {o}" for o in stats["active_orders"]) if stats["active_orders"] else "Нет активных заказов"
         resp_text = (
             "🤔 Проверка статуса на линии\n\n"
-            f"👤 Курьер: {driver['full_name']}\n"
+            f"👤 Курьер: {_short_first_name(driver['full_name'])}\n"
             f"🏢 Парк: {driver['park_name']}\n"
             f"📌 Статус профиля: {driver['work_status']}\n"
             f"📡 Линия: {line_human}\n\n"
@@ -1917,7 +2163,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             async with aiohttp.ClientSession() as session:
                 stats = await _get_driver_orders_stats(session, park, driver["id"], registered_dt=reg_dt)
         except Exception as exc:
-            await tg_send_text(chat_id, f"⚠️ Ошибка расчёта цели: {exc}", reply_markup=kb_courier_cabinet())
+            await send_ephemeral_text(chat_id, f"⚠️ Ошибка расчёта цели: {exc}", reply_markup=kb_courier_cabinet())
             return
 
         done = stats["completed_14d_from_reg"]
@@ -1941,13 +2187,68 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         await tg_send_text(chat_id, resp_text, reply_markup=kb_courier_cabinet())
         return
 
+    if norm_cmd in ("корректировки", "штрафы", "мои корректировки", "выгрузить штрафы"):
+        driver = await get_saved_profile_or_redirect(chat_id)
+        if not driver:
+            return
+        park = get_park_by_id(driver["park_id"])
+        await send_ephemeral_text(
+            chat_id,
+            "⏳ Выгружаю информацию по штрафам и корректировкам от Яндекса...",
+            reply_markup=kb_courier_cabinet(),
+            ttl_sec=12,
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                fines_data = await _get_driver_fines_and_adjustments(session, park, driver["id"], force_refresh=True)
+        except Exception as exc:
+            await send_ephemeral_text(
+                chat_id,
+                f"⚠️ Не удалось выгрузить штрафы от Яндекса: {exc}",
+                reply_markup=kb_courier_cabinet(),
+            )
+            return
+
+        if not fines_data["ok"]:
+            await tg_send_text(
+                chat_id,
+                f"⚖️ Корректировки и штрафы Яндекса\n\n"
+                f"Не удалось получить выгрузку напрямую ({fines_data['error']}).\n"
+                "Нажмите «❓ Помощь», чтобы запросить детальную выгрузку по штрафам у оператора парка.",
+                reply_markup=kb_courier_cabinet(),
+            )
+            return
+
+        fines_list = fines_data["fines"]
+        if not fines_list:
+            await tg_send_text(
+                chat_id,
+                "⚖️ Корректировки и штрафы Яндекса (за 30 дней)\n\n"
+                "Штрафов и списаний по корректировкам от Яндекса не найдено.\n"
+                "Если хотите оспорить начисление или уточнить детали — нажмите «❓ Помощь».",
+                reply_markup=kb_courier_cabinet(),
+            )
+            return
+
+        lines = [
+            "⚖️ Выгрузка штрафов и корректировок Яндекса (за 30 дней):",
+            f"Сумма удержаний/корректировок: {fines_data['total_fines_rub']:.2f} ₽\n",
+        ]
+        for idx, item in enumerate(fines_list, start=1):
+            desc_part = f" — {item['description']}" if item.get("description") and item["description"] != item["title"] else ""
+            lines.append(f"{idx}. [{item['date']}] {item['title']}{desc_part}: -{item['amount']:.2f} ₽")
+        lines.append("\nПо вопросам корректировок нажмите «❓ Помощь».")
+
+        await tg_send_text(chat_id, "\n".join(lines), reply_markup=kb_courier_cabinet())
+        return
+
     if step == "courier_auth_phone":
         raw_phone = contact_phone or raw_text
         if len(re.sub(r"\D", "", raw_phone)) < 10:
-            await tg_send_text(
+            await send_ephemeral_text(
                 chat_id,
-                "Номер введён не полностью. Введите номер в формате +7 999 123-45-67:",
-                reply_markup=kb_step_with_help(),
+                "Номер введён не полностью. Нажмите «📱 Отправить номер профиля» или введите номер в формате +7 999 123-45-67:",
+                reply_markup=kb_courier_phone_auth(),
             )
             return
         clear_user_state(chat_id)
@@ -1957,16 +2258,16 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     if step == "courier_pick_profile":
         if norm_cmd == "хочу ввести другой номер":
             set_user_state(chat_id, "courier_auth_phone", {})
-            await tg_send_text(
+            await send_ephemeral_text(
                 chat_id,
-                "Введите номер телефона, привязанный к аккаунту в парке:",
-                reply_markup=kb_step_with_help(),
+                "Отправьте номер профиля кнопкой или введите текстом:",
+                reply_markup=kb_courier_phone_auth(),
             )
             return
         profiles = PENDING_PROFILES.get(str(chat_id), [])
         m = re.match(r"^(\d+)", raw_text.strip())
         if not m or int(m.group(1)) < 1 or int(m.group(1)) > len(profiles):
-            await tg_send_text(
+            await send_ephemeral_text(
                 chat_id,
                 "Выберите профиль на клавиатуре или напишите его номер:",
                 reply_markup=kb_profiles_choice(profiles) if profiles else kb_start_menu(),
@@ -1981,7 +2282,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     if step == "reg_transport":
         chosen_transport = parse_transport_choice(raw_text)
         if not chosen_transport:
-            await tg_send_text(
+            await send_ephemeral_text(
                 chat_id,
                 "Выберите формат доставки на клавиатуре:",
                 reply_markup=kb_transport_choice(),
@@ -2009,7 +2310,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
 
     if step == "reg_city":
         if len(raw_text) < 2:
-            await tg_send_text(chat_id, "Напишите корректное название города:", reply_markup=kb_step_with_help())
+            await send_ephemeral_text(chat_id, "Напишите корректное название города:", reply_markup=kb_step_with_help())
             return
         data = update_user_state_data(chat_id, city=raw_text)
         if data.get("return_to_confirm"):
@@ -2025,7 +2326,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
 
     if step == "reg_name":
         if len(raw_text) < 2:
-            await tg_send_text(chat_id, "Напишите ваши Фамилию и Имя:", reply_markup=kb_step_with_help())
+            await send_ephemeral_text(chat_id, "Напишите ваши Фамилию и Имя:", reply_markup=kb_step_with_help())
             return
         data = update_user_state_data(chat_id, name=raw_text)
         if data.get("return_to_confirm"):
@@ -2042,7 +2343,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     if step == "reg_phone":
         raw_phone = contact_phone or raw_text
         if len(re.sub(r"\D", "", raw_phone)) < 10:
-            await tg_send_text(
+            await send_ephemeral_text(
                 chat_id,
                 "Номер введён не полностью. Введите номер в формате +7 999 123-45-67:",
                 reply_markup=kb_step_with_help(),
@@ -2065,7 +2366,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
 
     if step == "reg_sts_front":
         if not file_id:
-            await tg_send_text(
+            await send_ephemeral_text(
                 chat_id,
                 "Пришлите фото лицевой стороны СТС (1 из 2):",
                 reply_markup=kb_step_with_help(),
@@ -2082,7 +2383,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
 
     if step == "reg_sts_back":
         if not file_id:
-            await tg_send_text(
+            await send_ephemeral_text(
                 chat_id,
                 "Пришлите фото обратной стороны СТС (2 из 2):",
                 reply_markup=kb_step_with_help(),
@@ -2105,7 +2406,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if norm_cmd in ("да", "верно", "подтверждаю", "ок", "yes"):
             await finalize_registration(chat_id, data, tg_username, contact_name)
             return
-        await tg_send_text(
+        await send_ephemeral_text(
             chat_id,
             "Нажмите «Да», если данные верны, или «Исправить»:",
             reply_markup=kb_confirm_application(),
@@ -2140,7 +2441,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
                 reply_markup=kb_step_with_help(),
             )
             return
-        await tg_send_text(chat_id, "Выберите поле для изменения:", reply_markup=kb_edit_field_choice(data))
+        await send_ephemeral_text(chat_id, "Выберите поле для изменения:", reply_markup=kb_edit_field_choice(data))
         return
 
     await send_start_menu(chat_id, first_name=first_name)
@@ -2192,6 +2493,7 @@ async def handle_tg_webhook(request: web.Request) -> web.Response:
 
 async def on_startup(app: web.Application) -> None:
     app["delayed_worker"] = asyncio.create_task(delayed_notifications_worker())
+    app["ephemeral_worker"] = asyncio.create_task(ephemeral_cleaner_worker())
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN пуст! Укажите токен бота от @BotFather.")
         return
@@ -2206,7 +2508,7 @@ async def on_startup(app: web.Application) -> None:
 
 
 async def on_cleanup(app: web.Application) -> None:
-    for task_key in ("polling_task", "delayed_worker"):
+    for task_key in ("polling_task", "delayed_worker", "ephemeral_worker"):
         task = app.get(task_key)
         if task:
             task.cancel()
