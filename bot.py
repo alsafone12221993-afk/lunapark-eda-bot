@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -13,34 +15,29 @@ import aiohttp
 from aiohttp import web
 
 # ================= КОНФИГУРАЦИЯ =================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9247740629:AAFQkgRcuqe-x5P-I6R-FMW89meTIzYuF54").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9247740629:AAGDDIXtFOfRj66kiX7gDReNZ1IdnxudOT4").strip()
 TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
-# Время жизни исчезающих сообщений (в секундах)
 EPHEMERAL_TTL_SEC = int(os.getenv("EPHEMERAL_TTL_SEC", "25"))
 
-# Суперадмин (только этот ID может назначать и снимать админов)
 SUPERADMIN_ID = os.getenv("SUPERADMIN_ID", "673430213").strip()
 
-# Начальные админы / операторы (дополнительно управляются через /addadmin и /deladmin)
 _raw_admins = os.getenv("OPERATOR_ADMIN_IDS", SUPERADMIN_ID).strip()
 INITIAL_ADMIN_IDS: set[str] = {
     x.strip() for x in _raw_admins.split(",") if x.strip()
 } | {SUPERADMIN_ID}
 
-# ID чата/группы операторов для уведомлений по «Помощи» и живых диалогов
 OPERATOR_CHAT_ID = os.getenv("OPERATOR_CHAT_ID", SUPERADMIN_ID).strip()
 
-# Порог почасового спроса по умолчанию
 DEMAND_RATE_RUB_PER_HOUR = int(os.getenv("DEMAND_RATE_RUB_PER_HOUR", "800"))
 
-# Защита от перебора номеров при входе в кабинет
-AUTH_MAX_ATTEMPTS = 5
+AUTH_MAX_ATTEMPTS = 3
 AUTH_WINDOW_SEC = 600
-AUTH_LOCK_SEC = 900
+AUTH_LOCK_LEVELS_SEC = [900, 3600, 86400]
+FLOOD_MAX_MSG_PER_MIN = 25
 
-# Основной парк (Яндекс Fleet API)
 PARKS_CONFIG: list[dict[str, str]] = [
     {
         "name": "ЛунапаркЕда",
@@ -50,7 +47,6 @@ PARKS_CONFIG: list[dict[str, str]] = [
     },
 ]
 
-# amoCRM
 AMOCRM_BASE_URL = os.getenv("AMOCRM_BASE_URL", "https://lunapark7042.amocrm.ru").strip()
 AMOCRM_ACCESS_TOKEN = os.getenv(
     "AMOCRM_ACCESS_TOKEN",
@@ -60,14 +56,17 @@ AMOCRM_PIPELINE_ID = int(os.getenv("AMOCRM_PIPELINE_ID", "10053610"))
 AMOCRM_STATUS_ID = int(os.getenv("AMOCRM_STATUS_ID", "79731826"))
 AMOCRM_CLOSED_LOST_ID = int(os.getenv("AMOCRM_CLOSED_LOST_ID", "143"))
 
+# Можно явно прописать ID полей из amoCRM (если оставить None — найдутся автоматически по названию)
 AMOCRM_FIELD_IDS: dict[str, int | None] = {
     "lead_telegram": None,
     "lead_city": None,
+    "lead_address": None,
     "lead_transport": None,
     "lead_phone": None,
     "lead_problem": None,
     "contact_telegram": None,
     "contact_city": None,
+    "contact_address": None,
     "contact_transport": None,
 }
 
@@ -82,10 +81,12 @@ EPHEMERAL_MSGS_FILE = "ephemeral_messages.json"
 ADMIN_CONFIG_FILE = "admin_config.json"
 PENDING_DEMANDS_FILE = "pending_demands.json"
 AUTH_GUARD_FILE = "auth_guard.json"
+PHONE_OWNERS_FILE = "phone_owners.json"
 
 FLEET_API_URL = "https://fleet-api.taxi.yandex.net"
 
 GOAL_ORDERS = 5
+GOAL_HIDE_AFTER_ORDERS = 5
 GOAL_DAYS = 14
 GOAL_BONUS = 500
 PROFILE_READY_DELAY_SEC = 360
@@ -105,6 +106,7 @@ PENDING_PROFILES: dict[str, list[dict[str, Any]]] = {}
 _FIELDS_CATALOG_CACHE: dict[str, list[dict[str, Any]]] = {}
 _FILE_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 _STATS_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+_FLOOD_TIMESTAMPS: dict[str, list[float]] = defaultdict(list)
 
 VEHICLE_DOCS_KEYWORDS = ("авто", "мото", "груз")
 
@@ -179,7 +181,7 @@ def kb_admin_menu(is_superadmin: bool = False) -> dict[str, Any]:
         ["📣 Рассылка", "🔥 Проверить спрос"],
     ]
     if is_superadmin:
-        rows.append(["👥 Список админов"])
+        rows.append(["👥 Список админов", "🔓 Сбросить привязку"])
     rows.append(["⬅️ В начало"])
     return _reply_kb(rows)
 
@@ -233,7 +235,7 @@ def kb_confirm_application() -> dict[str, Any]:
 def kb_edit_field_choice(data: dict[str, Any]) -> dict[str, Any]:
     rows: list[list[str | dict[str, Any]]] = [
         ["Изменить формат", "Изменить город"],
-        ["Изменить имя", "Изменить телефон"],
+        ["Изменить ФИО", "Изменить телефон"],
         ["Изменить прописку"],
     ]
     if requires_vehicle_docs(data.get("transport", "")):
@@ -243,12 +245,20 @@ def kb_edit_field_choice(data: dict[str, Any]) -> dict[str, Any]:
     return _reply_kb(rows)
 
 
-def kb_courier_cabinet() -> dict[str, Any]:
-    return _reply_kb([
-        ["📊 Моя статистика", "🎁 Бонус"],
-        ["⚖️ Корректировки", "❓ Помощь"],
-        ["🔄 Сменить номер", "⬅️ В начало"],
-    ])
+def kb_courier_cabinet(show_bonus: bool = True) -> dict[str, Any]:
+    if show_bonus:
+        rows: list[list[str | dict[str, Any]]] = [
+            ["📊 Моя статистика", "🎁 Бонус"],
+            ["⚖️ Корректировки", "❓ Помощь"],
+            ["🔄 Сменить номер", "⬅️ В начало"],
+        ]
+    else:
+        rows = [
+            ["📊 Моя статистика", "⚖️ Корректировки"],
+            ["❓ Помощь", "🔄 Сменить номер"],
+            ["⬅️ В начало"],
+        ]
+    return _reply_kb(rows)
 
 
 def kb_profiles_choice(profiles: list[dict[str, Any]]) -> dict[str, Any]:
@@ -363,9 +373,20 @@ def _has_all_vehicle_docs(data: dict[str, Any]) -> bool:
     )
 
 
-# ================= ЗАЩИТА ОТ ПЕРЕБОРА НОМЕРОВ ПРИ ВХОДЕ =================
+# ================= МНОГОУРОВНЕВАЯ ЗАЩИТА ОТ ВЗЛОМА И ПЕРЕБОРА =================
+def check_flood_limit(chat_id: int | str) -> bool:
+    key = str(chat_id)
+    now = time.monotonic()
+    arr = [t for t in _FLOOD_TIMESTAMPS[key] if now - t <= 60.0]
+    if len(arr) >= FLOOD_MAX_MSG_PER_MIN:
+        _FLOOD_TIMESTAMPS[key] = arr
+        return False
+    arr.append(now)
+    _FLOOD_TIMESTAMPS[key] = arr
+    return True
+
+
 def check_auth_rate_limit(chat_id: int | str) -> tuple[bool, int]:
-    """Возвращает (разрешено, секунд_до_разблокировки)."""
     guard = _read_json(AUTH_GUARD_FILE, {})
     if not isinstance(guard, dict):
         guard = {}
@@ -383,7 +404,13 @@ def check_auth_rate_limit(chat_id: int | str) -> tuple[bool, int]:
     return True, 0
 
 
-def record_auth_attempt(chat_id: int | str, success: bool) -> None:
+async def record_auth_attempt(
+    chat_id: int | str,
+    success: bool,
+    reason: str = "",
+    tg_username: str = "",
+    tried_phone: str = "",
+) -> None:
     guard = _read_json(AUTH_GUARD_FILE, {})
     if not isinstance(guard, dict):
         guard = {}
@@ -393,15 +420,75 @@ def record_auth_attempt(chat_id: int | str, success: bool) -> None:
         guard.pop(key, None)
         _write_json(AUTH_GUARD_FILE, guard)
         return
+
     rec = guard.get(key) if isinstance(guard.get(key), dict) else {}
     attempts = [float(t) for t in (rec.get("attempts") or []) if now - float(t) <= AUTH_WINDOW_SEC]
     attempts.append(now)
     rec["attempts"] = attempts
+    lock_level = int(rec.get("lock_level") or 0)
+
     if len(attempts) >= AUTH_MAX_ATTEMPTS:
-        rec["locked_until"] = now + AUTH_LOCK_SEC
+        lock_sec = AUTH_LOCK_LEVELS_SEC[min(lock_level, len(AUTH_LOCK_LEVELS_SEC) - 1)]
+        rec["locked_until"] = now + lock_sec
         rec["attempts"] = []
+        rec["lock_level"] = lock_level + 1
+        guard[key] = rec
+        _write_json(AUTH_GUARD_FILE, guard)
+
+        tg_login = format_tg_login(chat_id, tg_username)
+        masked_phone = (tried_phone[:5] + "***" + tried_phone[-2:]) if len(tried_phone) >= 7 else tried_phone
+        alert = (
+            "🚨 Сработала защита от взлома / перебора номеров!\n\n"
+            f"🆔 Telegram ID: {chat_id} ({tg_login})\n"
+            f"📌 Причина: {reason or 'превышен лимит попыток входа'}\n"
+            f"📱 Последний номер: {masked_phone or '—'}\n"
+            f"🔒 Блокировка на {lock_sec // 60} мин (уровень {lock_level + 1})."
+        )
+        if str(chat_id) != SUPERADMIN_ID:
+            await tg_send_text(SUPERADMIN_ID, alert)
+        return
+
     guard[key] = rec
     _write_json(AUTH_GUARD_FILE, guard)
+
+
+def _phone_hash(norm_phone: str) -> str:
+    salt = hashlib.sha256(SUPERADMIN_ID.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(f"{salt}:{norm_phone}".encode("utf-8")).hexdigest()
+
+
+def get_phone_bound_owner(norm_phone: str) -> str | None:
+    owners = _read_json(PHONE_OWNERS_FILE, {})
+    if not isinstance(owners, dict):
+        return None
+    val = owners.get(_phone_hash(norm_phone))
+    if isinstance(val, dict):
+        owner_id = val.get("owner_tg_id")
+        return str(owner_id) if owner_id else None
+    return str(val) if val else None
+
+
+def bind_phone_to_owner(norm_phone: str, chat_id: int | str) -> None:
+    owners = _read_json(PHONE_OWNERS_FILE, {})
+    if not isinstance(owners, dict):
+        owners = {}
+    owners[_phone_hash(norm_phone)] = {
+        "owner_tg_id": str(chat_id),
+        "bound_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json(PHONE_OWNERS_FILE, owners)
+
+
+def unbind_phone_owner(norm_phone: str) -> bool:
+    owners = _read_json(PHONE_OWNERS_FILE, {})
+    if not isinstance(owners, dict):
+        return False
+    h = _phone_hash(norm_phone)
+    if h in owners:
+        owners.pop(h, None)
+        _write_json(PHONE_OWNERS_FILE, owners)
+        return True
+    return False
 
 
 # ================= ПРАВА СУПЕРАДМИНА И АДМИНОВ =================
@@ -592,6 +679,7 @@ def save_user_session(
     address: str = "",
     username: str = "",
     full_name: str = "",
+    bonus_completed: bool | None = None,
 ) -> dict[str, Any]:
     db = _read_json(USERS_FILE, {})
     key = str(chat_id)
@@ -616,6 +704,8 @@ def save_user_session(
         entry["username"] = username.lstrip("@").strip()
     if full_name:
         entry["full_name"] = full_name.strip()
+    if bonus_completed is not None:
+        entry["bonus_completed"] = bool(bonus_completed)
     db[key] = entry
     _write_json(USERS_FILE, db)
     return entry
@@ -673,7 +763,7 @@ async def tg_api(session: aiohttp.ClientSession, method: str, payload: dict[str,
     async with session.post(url, json=payload, timeout=25) as resp:
         data = await resp.json()
         if not data.get("ok"):
-            logger.warning("Telegram API %s вернул ok=False: %s", method, data)
+            logger.warning("Telegram API %s вернул ok=False: %s", method, data.get("description") or "error")
         return data
 
 
@@ -970,8 +1060,8 @@ def _build_field_value_item(field_def: dict[str, Any], raw_value: str) -> dict[s
                     break
         if matched_enum_id is not None:
             return {"field_id": fid, "values": [{"enum_id": int(matched_enum_id)}]}
-        if ftype == "select":
-            return None
+        # Если enum не совпал — пробуем передать текстовое значение (в некоторых полях это проходит)
+        return {"field_id": fid, "values": [{"value": val}]}
 
     return {"field_id": fid, "values": [{"value": val}]}
 
@@ -1032,6 +1122,8 @@ async def _find_or_create_contact_id(
     phone: str = "",
     tg_login: str = "",
     city: str = "",
+    address: str = "",
+    transport: str = "",
     contact_fields_cat: list[dict[str, Any]] | None = None,
 ) -> int | None:
     norm_p = normalize_phone(phone) if phone else ""
@@ -1060,6 +1152,8 @@ async def _find_or_create_contact_id(
             [
                 (AMOCRM_FIELD_IDS["contact_telegram"], ("telegram", "телеграм", "тг", "tg", "аккаунт", "логин"), tg_login),
                 (AMOCRM_FIELD_IDS["contact_city"], ("город", "city", "регион"), city),
+                (AMOCRM_FIELD_IDS["contact_address"], ("прописк", "адрес", "address"), address),
+                (AMOCRM_FIELD_IDS["contact_transport"], ("транспорт", "формат", "доставк", "авто", "категор"), transport),
             ],
         )
         contact_cf_values.extend(extra_cf)
@@ -1086,73 +1180,106 @@ async def _find_or_create_contact_id(
     return None
 
 
+async def _get_drive_base_url(session: aiohttp.ClientSession, base_url: str) -> str | None:
+    """Пытается получить актуальный URL файлового сервиса (Drive) аккаунта amoCRM."""
+    try:
+        async with session.get(
+            f"{base_url}/api/v4/account",
+            params={"with": "drive_url"},
+            headers=_amocrm_headers(),
+            timeout=15,
+        ) as resp:
+            if resp.status == 200:
+                acc = await resp.json()
+                for key in ("drive_url", "files_url", "drive_host"):
+                    val = acc.get(key)
+                    if isinstance(val, str) and val.strip().startswith("http"):
+                        return val.strip().rstrip("/")
+                emb = acc.get("_embedded") or {}
+                for key in ("drive_url", "drive"):
+                    val = emb.get(key)
+                    if isinstance(val, str) and val.strip().startswith("http"):
+                        return val.strip().rstrip("/")
+    except Exception:
+        pass
+    return None
+
+
 async def _upload_and_attach_docs(
     session: aiohttp.ClientSession,
     base_url: str,
     lead_id: int | None,
     contact_id: int | None,
-    doc_items: list[tuple[str, Optional[tuple[bytes, str]]]],
+    doc_items: list[tuple[str, Optional[tuple[bytes, str]], str]],
 ) -> list[str]:
+    """
+    Загружает/фиксирует документы без падения сделки при 404 на /api/v4/files.
+    Если файловый сервис amoCRM недоступен в аккаунте, оставляет аккуратную отметку в примечании
+    и отправляет фото операторам в чат/карточку, чтобы сделка всегда создавалась чисто.
+    """
+    non_empty = [(label, doc_tuple, fid) for label, doc_tuple, fid in doc_items if doc_tuple or fid]
+    if not non_empty:
+        return []
+
+    drive_url = await _get_drive_base_url(session, base_url)
     uploaded_lines: list[str] = []
-    for label, doc_tuple in doc_items:
-        if not doc_tuple:
+
+    for label, doc_tuple, tg_file_id in non_empty:
+        fname = doc_tuple[1] if doc_tuple else f"{label}.jpg"
+        raw_bytes = doc_tuple[0] if doc_tuple else None
+
+        if not drive_url or not raw_bytes:
+            uploaded_lines.append(f"{label}: {fname} — фото получено в Telegram (file_id: {tg_file_id or '—'})")
             continue
-        raw_bytes, fname = doc_tuple
-        mime = _guess_image_mime(fname)
-        form = aiohttp.FormData()
-        form.add_field("file", raw_bytes, filename=fname, content_type=mime)
+
         try:
+            # Пробуем запросить сессию загрузки на Drive API
             async with session.post(
-                f"{base_url}/api/v4/files",
-                data=form,
-                headers={"Authorization": f"Bearer {AMOCRM_ACCESS_TOKEN}"},
-                timeout=30,
-            ) as resp:
-                txt = await resp.text()
-                if resp.status not in (200, 201, 202):
-                    logger.warning("amoCRM /api/v4/files ошибка (%s) для %s: %s", resp.status, label, txt[:250])
-                    uploaded_lines.append(f"{label}: {fname} (ошибка загрузки {resp.status}: {txt[:120]})")
+                f"{drive_url}/v1.0/sessions",
+                headers=_amocrm_headers(),
+                json={"file_name": fname, "file_size": len(raw_bytes)},
+                timeout=20,
+            ) as s_resp:
+                if s_resp.status not in (200, 201, 202):
+                    uploaded_lines.append(f"{label}: {fname} — фото получено в Telegram (файл в примечании)")
+                    continue
+                s_data = await s_resp.json()
+                upload_url = s_data.get("upload_url") or s_data.get("next_url")
+                if not upload_url:
+                    uploaded_lines.append(f"{label}: {fname} — фото получено в Telegram")
                     continue
 
-                parsed = json.loads(txt) if txt else {}
-                item = None
-                if isinstance(parsed, list) and parsed:
-                    item = parsed[0]
-                elif isinstance(parsed, dict):
-                    files_list = (parsed.get("_embedded") or {}).get("files") or []
-                    item = files_list[0] if files_list else parsed
+                if not str(upload_url).startswith("http"):
+                    upload_url = f"{drive_url}/{str(upload_url).lstrip('/')}"
 
-                uuid_val = item.get("uuid") if isinstance(item, dict) else None
-                dl_url = (
-                    ((item.get("_links") or {}).get("download") or {}).get("href")
-                    if isinstance(item, dict)
-                    and isinstance((item.get("_links") or {}).get("download"), dict)
-                    else ((item.get("_links") or {}).get("download") if isinstance(item, dict) else None)
-                )
+                form = aiohttp.FormData()
+                form.add_field("file", raw_bytes, filename=fname, content_type=_guess_image_mime(fname))
+                async with session.post(
+                    upload_url,
+                    data=form,
+                    headers={"Authorization": f"Bearer {AMOCRM_ACCESS_TOKEN}"},
+                    timeout=30,
+                ) as u_resp:
+                    if u_resp.status not in (200, 201, 202):
+                        uploaded_lines.append(f"{label}: {fname} — фото получено в Telegram")
+                        continue
+                    u_data = await u_resp.json()
+                    file_uuid = u_data.get("uuid") or u_data.get("file_uuid")
+                    if file_uuid:
+                        for ent, eid in [("leads", lead_id), ("contacts", contact_id)]:
+                            if eid:
+                                await session.put(
+                                    f"{base_url}/api/v4/{ent}/{eid}/files",
+                                    headers=_amocrm_headers(),
+                                    json=[{"file_uuid": file_uuid}],
+                                    timeout=20,
+                                )
+                        uploaded_lines.append(f"{label}: {fname} (прикреплён)")
+                    else:
+                        uploaded_lines.append(f"{label}: {fname} (загружен)")
+        except Exception:
+            uploaded_lines.append(f"{label}: {fname} — фото получено в Telegram")
 
-                attached_ok = False
-                if uuid_val:
-                    for ent, eid in [("leads", lead_id), ("contacts", contact_id)]:
-                        if not eid:
-                            continue
-                        async with session.put(
-                            f"{base_url}/api/v4/{ent}/{eid}/files",
-                            headers=_amocrm_headers(),
-                            json=[{"file_uuid": uuid_val}],
-                            timeout=20,
-                        ) as put_resp:
-                            put_txt = await put_resp.text()
-                            if put_resp.status in (200, 201, 202):
-                                attached_ok = True
-                            else:
-                                logger.warning("amoCRM attach file warning (%s): %s", put_resp.status, put_txt[:200])
-
-                status_tag = "прикреплён" if attached_ok else "загружен"
-                link_part = f" — {dl_url}" if isinstance(dl_url, str) and dl_url else ""
-                uploaded_lines.append(f"{label}: {fname} ({status_tag}{link_part})")
-        except Exception as exc:
-            logger.exception("Ошибка загрузки %s в amoCRM: %s", label, exc)
-            uploaded_lines.append(f"{label}: {fname} (ошибка: {exc})")
     return uploaded_lines
 
 
@@ -1207,9 +1334,46 @@ async def _find_existing_client_lead(
     return None
 
 
+async def _patch_lead_fields_safe(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    lead_id: int,
+    lead_title: str,
+    lead_cf_values: list[dict[str, Any]],
+) -> list[str]:
+    """Обновляет сделку; если какое-то кастомное поле вызвало 400, повторяет без проблемного поля."""
+    warnings: list[str] = []
+    patch_obj: dict[str, Any] = {"name": lead_title}
+    if lead_cf_values:
+        patch_obj["custom_fields_values"] = lead_cf_values
+
+    async with session.patch(
+        f"{base_url}/api/v4/leads/{lead_id}",
+        headers=_amocrm_headers(),
+        json=patch_obj,
+        timeout=20,
+    ) as presp:
+        if presp.status in (200, 201, 202):
+            return warnings
+        err_txt = await presp.text()
+        logger.warning("amoCRM patch warning (%s): %s", presp.status, err_txt[:250])
+
+    # Пробуем записать каждое кастомное поле отдельно, чтобы валидные поля точно сохранились
+    for item in lead_cf_values:
+        async with session.patch(
+            f"{base_url}/api/v4/leads/{lead_id}",
+            headers=_amocrm_headers(),
+            json={"custom_fields_values": [item]},
+            timeout=15,
+        ) as single_resp:
+            if single_resp.status not in (200, 201, 202):
+                warnings.append(f"поле id={item.get('field_id')} не записано")
+    return warnings
+
+
 async def send_lead_to_amocrm(
     lead: dict[str, Any],
-    doc_items: list[tuple[str, Optional[tuple[bytes, str]]]] | None = None,
+    doc_items: list[tuple[str, Optional[tuple[bytes, str]], str]] | None = None,
 ) -> tuple[bool, str]:
     if not AMOCRM_BASE_URL or not AMOCRM_ACCESS_TOKEN:
         return False, "не заполнены AMOCRM_BASE_URL / AMOCRM_ACCESS_TOKEN"
@@ -1222,15 +1386,17 @@ async def send_lead_to_amocrm(
         tg_link = format_tg_link(chat_id, tg_username)
         phone = normalize_phone(lead.get("phone", ""))
         address = str(lead.get("address") or "").strip()
-        lead_title = f"ЛунапаркЕда ({lead['type']}): {lead['name']} — {lead['city']}"
+        city_val = str(lead.get("city") or "").strip()
+        transport_val = str(lead.get("transport") or "").strip()
+        lead_title = f"ЛунапаркЕда ({lead['type']}): {lead['name']} — {city_val or '—'}"
 
         note_lines = [
             "Парк: ЛунапаркЕда",
             f"Тип заявки: {lead['type']}",
-            f"Имя: {lead['name']}",
-            f"Город: {lead['city']}",
+            f"ФИО: {lead['name']}",
+            f"Город: {city_val or '—'}",
             f"Адрес прописки: {address or '—'}",
-            f"Формат/транспорт: {lead['transport']}",
+            f"Формат/транспорт: {transport_val or '—'}",
             f"Телефон: {phone}",
             f"Telegram: {tg_login}",
             f"Ссылка на чат: {tg_link}",
@@ -1247,9 +1413,9 @@ async def send_lead_to_amocrm(
                     lead_fields_cat,
                     [
                         (AMOCRM_FIELD_IDS["lead_telegram"], ("telegram", "телеграм", "тг", "tg", "аккаунт", "логин"), tg_login),
-                        (AMOCRM_FIELD_IDS["lead_city"], ("город", "city", "регион"), lead.get("city", "")),
-                        (None, ("прописк", "адрес", "address"), address),
-                        (AMOCRM_FIELD_IDS["lead_transport"], ("транспорт", "формат", "доставк", "авто", "категор"), lead.get("transport", "")),
+                        (AMOCRM_FIELD_IDS["lead_city"], ("город", "city", "регион"), city_val),
+                        (AMOCRM_FIELD_IDS["lead_address"], ("прописк", "адрес", "address"), address),
+                        (AMOCRM_FIELD_IDS["lead_transport"], ("транспорт", "формат", "доставк", "авто", "категор"), transport_val),
                         (AMOCRM_FIELD_IDS["lead_phone"], ("телефон", "phone", "номер"), phone),
                         (None, ("chat_id", "tg id", "telegram id", "id чата"), chat_id),
                         (None, ("ссылка", "профиль", "чат"), tg_link),
@@ -1263,27 +1429,18 @@ async def send_lead_to_amocrm(
                     contact_fields_cat,
                     [
                         (AMOCRM_FIELD_IDS["contact_telegram"], ("telegram", "телеграм", "тг", "tg", "аккаунт", "логин"), tg_login),
-                        (AMOCRM_FIELD_IDS["contact_city"], ("город", "city", "регион"), lead.get("city", "")),
-                        (None, ("прописк", "адрес", "address"), address),
-                        (AMOCRM_FIELD_IDS["contact_transport"], ("транспорт", "формат", "доставк", "авто"), lead.get("transport", "")),
+                        (AMOCRM_FIELD_IDS["contact_city"], ("город", "city", "регион"), city_val),
+                        (AMOCRM_FIELD_IDS["contact_address"], ("прописк", "адрес", "address"), address),
+                        (AMOCRM_FIELD_IDS["contact_transport"], ("транспорт", "формат", "доставк", "авто", "категор"), transport_val),
                     ],
                 )
                 contact_cf_values.extend(extra_contact_cf)
 
                 existing_lead_id = await _find_existing_client_lead(session, base_url, chat_id, phone)
                 if existing_lead_id:
-                    patch_obj: dict[str, Any] = {"name": lead_title}
-                    if lead_cf_values:
-                        patch_obj["custom_fields_values"] = lead_cf_values
-                    async with session.patch(
-                        f"{base_url}/api/v4/leads/{existing_lead_id}",
-                        headers=_amocrm_headers(),
-                        json=patch_obj,
-                        timeout=20,
-                    ) as presp:
-                        if presp.status not in (200, 201, 202):
-                            logger.warning("amoCRM patch warning (%s): %s", presp.status, await presp.text())
-
+                    cf_warns = await _patch_lead_fields_safe(session, base_url, existing_lead_id, lead_title, lead_cf_values)
+                    if cf_warns:
+                        note_lines.append("Примечание по полям: " + ", ".join(cf_warns))
                     doc_lines = await _upload_and_attach_docs(
                         session, base_url, existing_lead_id, None, doc_items or []
                     )
@@ -1315,8 +1472,35 @@ async def send_lead_to_amocrm(
                 async with session.post(url, headers=_amocrm_headers(), json=payload, timeout=20) as resp:
                     resp_text = await resp.text()
                     if resp.status not in (200, 201, 202):
-                        return False, f"HTTP {resp.status}: {resp_text[:250]}"
-                    created = json.loads(resp_text)
+                        # Повторяем без custom_fields_values, чтобы сделка всё равно создалась и данные ушли в примечание
+                        fallback_payload = [
+                            {
+                                "name": lead_title,
+                                **({"pipeline_id": AMOCRM_PIPELINE_ID} if AMOCRM_PIPELINE_ID else {}),
+                                **({"status_id": AMOCRM_STATUS_ID} if AMOCRM_STATUS_ID else {}),
+                                "_embedded": {
+                                    "contacts": [
+                                        {
+                                            "first_name": lead["name"],
+                                            "custom_fields_values": (
+                                                [{"field_code": "PHONE", "values": [{"value": phone, "enum_code": "MOB"}]}]
+                                                if phone
+                                                else []
+                                            ),
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                        async with session.post(url, headers=_amocrm_headers(), json=fallback_payload, timeout=20) as fb_resp:
+                            fb_text = await fb_resp.text()
+                            if fb_resp.status not in (200, 201, 202):
+                                return False, f"HTTP {fb_resp.status}: {fb_text[:200]}"
+                            created = json.loads(fb_text)
+                            note_lines.append(f"Внимание по полям amoCRM: {resp_text[:180]}")
+                    else:
+                        created = json.loads(resp_text)
+
                     lead_id = created[0].get("id") if isinstance(created, list) and created else None
                     contact_id = None
                     if isinstance(created, list) and created:
@@ -1362,6 +1546,7 @@ async def send_help_to_amocrm(
         user_rec = get_user_record(chat_id)
         phone = user_rec.get("phone", "")
         city = user_rec.get("city", "")
+        address = user_rec.get("address", "")
 
         note_text = (
             "Парк: ЛунапаркЕда\n"
@@ -1388,6 +1573,7 @@ async def send_help_to_amocrm(
                     [
                         (AMOCRM_FIELD_IDS["contact_telegram"], ("telegram", "телеграм", "тг", "tg", "аккаунт", "логин"), tg_login),
                         (AMOCRM_FIELD_IDS["contact_city"], ("город", "city", "регион"), city),
+                        (AMOCRM_FIELD_IDS["contact_address"], ("прописк", "адрес", "address"), address),
                     ],
                 )
                 contact_cf_values.extend(extra_contact_cf)
@@ -1400,6 +1586,7 @@ async def send_help_to_amocrm(
                     phone=phone,
                     tg_login=tg_login,
                     city=city,
+                    address=address,
                     contact_fields_cat=contact_fields_cat,
                 )
 
@@ -1422,6 +1609,7 @@ async def send_help_to_amocrm(
                     [
                         (AMOCRM_FIELD_IDS["lead_telegram"], ("telegram", "телеграм", "тг", "tg", "аккаунт", "логин"), tg_login),
                         (AMOCRM_FIELD_IDS["lead_city"], ("город", "city", "регион"), city),
+                        (AMOCRM_FIELD_IDS["lead_address"], ("прописк", "адрес", "address"), address),
                         (AMOCRM_FIELD_IDS["lead_phone"], ("телефон", "phone", "номер"), phone),
                         (AMOCRM_FIELD_IDS["lead_problem"], ("проблем", "обращен", "вопрос", "сообщен", "причин"), problem_text.strip()),
                         (None, ("chat_id", "tg id", "telegram id", "id чата"), str(chat_id)),
@@ -1783,6 +1971,23 @@ def _is_completed_order_status(status: str) -> bool:
     )
 
 
+def _is_active_in_progress_order_status(status: str) -> bool:
+    s = (status or "").strip().lower()
+    return s in (
+        "driving",
+        "waiting",
+        "transporting",
+        "in_progress",
+        "assigned",
+        "accepted",
+        "arrived",
+        "delivering",
+        "в пути",
+        "выполняется",
+        "назначен",
+    )
+
+
 async def _get_driver_orders_stats(
     session: aiohttp.ClientSession,
     park: dict[str, str],
@@ -1972,7 +2177,7 @@ async def _get_driver_adjustments_list(
     return lines[:20]
 
 
-# ================= АДМИНКА, СПБ/МСК «ЗАКАЗЫ В ЧАС» И СПРОС ПО ГОРОДАМ =================
+# ================= АДМИНКА (С ОНЛАЙНОМ И ЗАКАЗАМИ), СПБ/МСК И СПРОС =================
 def _classify_transport_bucket(transport_str: str) -> str:
     low = (transport_str or "").lower()
     if "груз" in low:
@@ -1984,7 +2189,85 @@ def _classify_transport_bucket(transport_str: str) -> str:
     return "walk_bike"
 
 
-def build_admin_summary_text(period_days: int) -> str:
+async def get_live_park_activity_stats() -> dict[str, int]:
+    total_working_park = 0
+    on_line_now = 0
+    on_order_now = 0
+    recent_active_3h = 0
+
+    now = datetime.now(timezone.utc)
+    three_hours_ago = now - timedelta(hours=3)
+    active_driver_ids: set[str] = set()
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            for park in PARKS_CONFIG:
+                drivers = await get_cached_drivers(session, park, force_refresh=False)
+                for item in drivers:
+                    if not isinstance(item, dict):
+                        continue
+                    prof = item.get("driver_profile") or {}
+                    cur_status = item.get("current_status") or {}
+                    work_st = str(prof.get("work_status") or "").lower()
+                    online_st = str(cur_status.get("status") or prof.get("status") or "").lower()
+
+                    if work_st == "working":
+                        total_working_park += 1
+                    if online_st in ("free", "online", "ready", "busy", "in_order", "order"):
+                        on_line_now += 1
+                    if online_st in ("busy", "in_order", "order"):
+                        on_order_now += 1
+
+                try:
+                    odata = await _post_fleet_with_retry(
+                        session,
+                        park,
+                        "/v1/parks/orders/list",
+                        {
+                            "query": {
+                                "park": {
+                                    "id": park["park_id"],
+                                    "order": {
+                                        "booked_at": {
+                                            "from": three_hours_ago.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                            "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                        }
+                                    },
+                                }
+                            },
+                            "limit": 300,
+                        },
+                    )
+                    in_progress_drivers: set[str] = set()
+                    for o in odata.get("orders", []) or []:
+                        if not isinstance(o, dict):
+                            continue
+                        st = str(o.get("status") or "")
+                        d_prof = o.get("driver_profile") or {}
+                        did = str(d_prof.get("id") or o.get("driver_id") or "")
+                        if did:
+                            active_driver_ids.add(did)
+                        if _is_active_in_progress_order_status(st) and did:
+                            in_progress_drivers.add(did)
+
+                    if in_progress_drivers:
+                        on_order_now = max(on_order_now, len(in_progress_drivers))
+                    recent_active_3h = max(recent_active_3h, len(active_driver_ids))
+                except Exception:
+                    pass
+    except Exception as exc:
+        logger.warning("Ошибка получения лайв-активности парка: %s", exc)
+
+    effective_on_line = max(on_line_now, on_order_now, recent_active_3h)
+    return {
+        "total_working_park": total_working_park,
+        "on_line_now": effective_on_line,
+        "on_order_now": on_order_now,
+        "free_on_line": max(0, effective_on_line - on_order_now),
+    }
+
+
+async def build_admin_summary_text(period_days: int) -> str:
     users_db = _read_json(USERS_FILE, {})
     apps = _read_json(APPS_FILE, [])
     if not isinstance(users_db, dict):
@@ -2027,10 +2310,18 @@ def build_admin_summary_text(period_days: int) -> str:
             b = _classify_transport_bucket(str(app_item.get("transport") or ""))
             buckets[b] += 1
 
+    live_stats = await get_live_park_activity_stats()
+
     return (
         f"🛠 Админка ЛунапаркЕда (период: {period_days} дн.)\n\n"
+        f"📡 Онлайн и активность в парке сейчас:\n"
+        f"🟢 Активных курьеров на линии: {live_stats['on_line_now']}\n"
+        f"📦 Сейчас на заказах: {live_stats['on_order_now']}\n"
+        f"⏳ Свободны на линии: {live_stats['free_on_line']}\n"
+        f"🏢 Всего работающих в парке: {live_stats['total_working_park']}\n\n"
+        f"📊 Воронка и база бота:\n"
         f"👥 Всего в базе бота: {total_bot_users}\n"
-        f"🟢 Активных за период: {active_in_period}\n"
+        f"✨ Активных в боте за период: {active_in_period}\n"
         f"📥 Новых лидов за период: {new_leads_cnt}\n\n"
         f"Регистрации по транспорту:\n"
         f"🚶 Пешие / Вело: {buckets['walk_bike']}\n"
@@ -2040,7 +2331,8 @@ def build_admin_summary_text(period_days: int) -> str:
         f"Команды:\n"
         f"• /period <дни> — сменить период\n"
         f"• /broadcast <текст> — массовая рассылка\n"
-        f"• /addadmin <tg_id> / /deladmin <tg_id> — права админов (суперадмин)"
+        f"• /unbind <телефон> — сбросить привязку номера\n"
+        f"• /addadmin <tg_id> / /deladmin <tg_id> — права админов"
     )
 
 
@@ -2264,6 +2556,27 @@ async def demand_monitor_worker() -> None:
 
 
 # ================= ЭКРАНЫ И СЦЕНАРИИ =================
+async def should_show_bonus_button(chat_id: int | str, driver: dict[str, Any] | None = None) -> bool:
+    rec = get_user_record(chat_id)
+    if rec.get("bonus_completed"):
+        return False
+    if not driver:
+        return True
+    try:
+        park = get_park_by_id(driver["park_id"])
+        goal_start = get_goal_start_dt(chat_id)
+        async with aiohttp.ClientSession() as session:
+            stats = await _get_driver_orders_stats(session, park, driver["id"], goal_start_dt=goal_start)
+        done_goal = int(stats.get("completed_goal") or 0)
+        done_7d = int(stats.get("completed_7d") or 0)
+        if done_goal >= GOAL_HIDE_AFTER_ORDERS or done_7d >= 10:
+            save_user_session(chat_id, bonus_completed=True)
+            return False
+    except Exception:
+        pass
+    return True
+
+
 async def send_start_menu(chat_id: int | str, first_name: str = "друг") -> None:
     clear_user_state(chat_id)
     text = (
@@ -2286,7 +2599,7 @@ async def show_confirmation_screen(chat_id: int | str, data: dict[str, Any]) -> 
 
     text = (
         "Проверь, пожалуйста, всё ли корректно:\n\n"
-        f"Имя: {data.get('name', '—')}\n"
+        f"ФИО: {data.get('name', '—')}\n"
         f"Город: {data.get('city', '—')}\n"
         f"Формат: {data.get('transport', '—')}\n"
         f"Телефон: {data.get('phone', '—')}\n"
@@ -2299,13 +2612,15 @@ async def show_confirmation_screen(chat_id: int | str, data: dict[str, Any]) -> 
 
 async def show_courier_welcome(chat_id: int | str, driver: dict[str, Any]) -> None:
     first_name = _short_first_name(driver["full_name"])
+    show_bonus = await should_show_bonus_button(chat_id, driver)
+    bonus_phrase = "проверить прогресс по бонусу, " if show_bonus else ""
     text = (
         f"Привет, {first_name}! Рады видеть тебя в ЛунапаркЕда.\n\n"
-        "Здесь ты всегда можешь глянуть свежую статистику по заказам и пробегу, "
-        "проверить прогресс по бонусу, посмотреть корректировки без лишних сложностей "
-        "или написать нам, если понадобится помощь. Хороших смен и ровных маршрутов."
+        f"Здесь ты всегда можешь глянуть свежую статистику по заказам и пробегу, "
+        f"{bonus_phrase}посмотреть корректировки без лишних сложностей "
+        f"или написать нам, если понадобится помощь. Хороших смен и ровных маршрутов."
     )
-    await tg_send_text(chat_id, text, reply_markup=kb_courier_cabinet())
+    await tg_send_text(chat_id, text, reply_markup=kb_courier_cabinet(show_bonus=show_bonus))
 
 
 async def show_courier_statistics(chat_id: int | str, driver: dict[str, Any]) -> None:
@@ -2317,20 +2632,32 @@ async def show_courier_statistics(chat_id: int | str, driver: dict[str, Any]) ->
     except Exception:
         stats = {
             "completed_7d": 0,
+            "completed_goal": 0,
             "distance_km_7d": 0.0,
             "distance_estimated": False,
         }
 
+    done_goal = int(stats.get("completed_goal") or 0)
+    done_7d = int(stats.get("completed_7d") or 0)
+    if done_goal >= GOAL_HIDE_AFTER_ORDERS or done_7d >= 10:
+        save_user_session(chat_id, bonus_completed=True)
+
+    show_bonus = await should_show_bonus_button(chat_id, driver)
     km_suffix = " км (примерно)" if stats.get("distance_estimated") else " км"
+    footer = (
+        "Отличный темп! Если захочешь посмотреть прогресс по бонусу — жми «🎁 Бонус»."
+        if show_bonus
+        else "Отличный темп! Хороших смен и щедрых заказов."
+    )
     text = (
         "Вот твоя свежая сводка за последние 7 дней ✨\n\n"
         f"🏢 Парк: {driver['park_name']}\n"
         f"💳 Баланс: {driver['balance']:.2f} ₽\n"
         f"📦 Заказов выполнено: {stats['completed_7d']}\n"
         f"🛣 Прошёл / проехал: {stats['distance_km_7d']:.1f}{km_suffix}\n\n"
-        "Отличный темп! Если захочешь посмотреть прогресс по бонусу — жми «🎁 Бонус»."
+        f"{footer}"
     )
-    await tg_send_text(chat_id, text, reply_markup=kb_courier_cabinet())
+    await tg_send_text(chat_id, text, reply_markup=kb_courier_cabinet(show_bonus=show_bonus))
 
 
 async def get_saved_profile_or_redirect(chat_id: int | str) -> dict[str, Any] | None:
@@ -2340,7 +2667,18 @@ async def get_saved_profile_or_redirect(chat_id: int | str) -> dict[str, Any] | 
         set_user_state(chat_id, "courier_auth_phone", {})
         await send_ephemeral_text(
             chat_id,
-            "Скинь номер профиля кнопкой ниже или напиши его текстом:",
+            "Подтверди свой профиль кнопкой «📱 Отправить номер профиля»:",
+            reply_markup=kb_courier_phone_auth(),
+        )
+        return None
+
+    bound_owner = get_phone_bound_owner(phone)
+    if bound_owner and str(bound_owner) != str(chat_id) and not is_admin_user(chat_id, chat_id):
+        save_user_session(chat_id, phone="", park_id="", driver_id="")
+        set_user_state(chat_id, "courier_auth_phone", {})
+        await send_ephemeral_text(
+            chat_id,
+            "Этот номер закреплён за другим Telegram-аккаунтом. Подтверди свой номер кнопкой ниже:",
             reply_markup=kb_courier_phone_auth(),
         )
         return None
@@ -2358,7 +2696,12 @@ async def get_saved_profile_or_redirect(chat_id: int | str) -> dict[str, Any] | 
     return profiles[0]
 
 
-async def lookup_and_route_phone(chat_id: int | str, phone: str, used_contact_button: bool = False) -> None:
+async def lookup_and_route_phone(
+    chat_id: int | str,
+    phone: str,
+    used_contact_button: bool = False,
+    tg_username: str = "",
+) -> None:
     allowed, wait_sec = check_auth_rate_limit(chat_id)
     if not allowed:
         await send_ephemeral_text(
@@ -2366,6 +2709,43 @@ async def lookup_and_route_phone(chat_id: int | str, phone: str, used_contact_bu
             f"Слишком много попыток проверки номера. Подожди {wait_sec} сек и попробуй снова.",
             reply_markup=kb_start_menu(is_admin=is_admin_user(chat_id, chat_id)),
             ttl_sec=15,
+        )
+        return
+
+    norm_p = normalize_phone(phone)
+    is_adm = is_admin_user(chat_id, chat_id)
+
+    bound_owner = get_phone_bound_owner(norm_p)
+    if bound_owner and str(bound_owner) != str(chat_id) and not is_adm:
+        await record_auth_attempt(
+            chat_id,
+            success=False,
+            reason="попытка входа по чужому привязанному номеру",
+            tg_username=tg_username,
+            tried_phone=norm_p,
+        )
+        await tg_send_text(
+            chat_id,
+            "🔒 Этот номер уже привязан к другому Telegram-аккаунту.\n"
+            "Доступ к данным профиля запрещён в целях безопасности. Если ты сменил аккаунт — напиши в «❓ Помощь».",
+            reply_markup=kb_start_menu(is_admin=False),
+        )
+        return
+
+    if not bound_owner and not used_contact_button and not is_adm:
+        await record_auth_attempt(
+            chat_id,
+            success=False,
+            reason="ручной ввод непривязанного номера без кнопки контакта",
+            tg_username=tg_username,
+            tried_phone=norm_p,
+        )
+        set_user_state(chat_id, "courier_auth_phone", {})
+        await tg_send_text(
+            chat_id,
+            "🛡 Для защиты аккаунта от чужого доступа первый вход выполняется только через кнопку "
+            "«📱 Отправить номер профиля» (Telegram подтвердит, что номер принадлежит именно тебе).",
+            reply_markup=kb_courier_phone_auth(),
         )
         return
 
@@ -2377,17 +2757,23 @@ async def lookup_and_route_phone(chat_id: int | str, phone: str, used_contact_bu
     )
     try:
         async with aiohttp.ClientSession() as session:
-            profiles = await _find_all_profiles_by_phone(session, phone)
+            profiles = await _find_all_profiles_by_phone(session, norm_p)
     except Exception as exc:
         await send_ephemeral_text(
             chat_id,
             f"Не получилось проверить номер: {exc}",
-            reply_markup=kb_start_menu(is_admin=is_admin_user(chat_id, chat_id)),
+            reply_markup=kb_start_menu(is_admin=is_adm),
         )
         return
 
     if not profiles:
-        record_auth_attempt(chat_id, success=False)
+        await record_auth_attempt(
+            chat_id,
+            success=False,
+            reason="номер не найден в базе парка",
+            tg_username=tg_username,
+            tried_phone=norm_p,
+        )
         await tg_send_text(
             chat_id,
             "Этот номер не зарегистрирован в парке.\n\n"
@@ -2396,13 +2782,15 @@ async def lookup_and_route_phone(chat_id: int | str, phone: str, used_contact_bu
         )
         return
 
-    record_auth_attempt(chat_id, success=True)
+    await record_auth_attempt(chat_id, success=True)
+    if not is_adm:
+        bind_phone_to_owner(norm_p, chat_id)
 
     if len(profiles) == 1:
         chosen = profiles[0]
         save_user_session(
             chat_id,
-            phone=phone,
+            phone=norm_p,
             park_id=chosen["park_id"],
             driver_id=chosen["id"],
             city=chosen.get("city", ""),
@@ -2433,7 +2821,7 @@ async def finalize_registration(
     contact_name: str,
 ) -> None:
     clear_user_state(chat_id)
-    norm_phone = data.get("phone", "")
+    norm_phone = normalize_phone(data.get("phone", ""))
     city_val = data.get("city", "")
     address_val = data.get("address", "")
     save_user_session(
@@ -2444,6 +2832,8 @@ async def finalize_registration(
         username=tg_username,
         full_name=data.get("name") or contact_name,
     )
+    if norm_phone:
+        bind_phone_to_owner(norm_phone, chat_id)
 
     tg_login = format_tg_login(chat_id, tg_username)
     lead_payload = {
@@ -2464,16 +2854,29 @@ async def finalize_registration(
         ("vu_front_file_id", "ВУ (лицевая сторона)", f"vu_front_{chat_id}.jpg"),
         ("vu_back_file_id", "ВУ (обратная сторона)", f"vu_back_{chat_id}.jpg"),
     ]
-    doc_items: list[tuple[str, Optional[tuple[bytes, str]]]] = []
+    doc_items: list[tuple[str, Optional[tuple[bytes, str]], str]] = []
     for fid_key, label, fname in doc_specs:
-        if data.get(fid_key):
-            dl = await tg_download_file(data[fid_key], fname)
-            doc_items.append((label, dl))
+        fid_val = str(data.get(fid_key) or "")
+        if fid_val:
+            dl = await tg_download_file(fid_val, fname)
+            doc_items.append((label, dl, fid_val))
 
     try:
         await send_lead_to_amocrm(lead_payload, doc_items=doc_items)
     except Exception as exc:
         logger.warning("Ошибка отправки заявки в amoCRM: %s", exc)
+
+    # Пересылаем загруженные фото документов в чат операторов/админа, чтобы ничего не потерялось
+    if doc_items:
+        for target in ({OPERATOR_CHAT_ID} | set(load_admin_config()["admins"])):
+            if target and str(target) != str(chat_id):
+                for label, _, fid_val in doc_items:
+                    if fid_val:
+                        await tg_send_photo(
+                            target,
+                            fid_val,
+                            caption=f"{label} — {lead_payload['name']} ({tg_login}, ID: {chat_id})",
+                        )
 
     await tg_send_text(
         chat_id,
@@ -2533,6 +2936,9 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     if not chat_id:
         return
 
+    if not check_flood_limit(chat_id):
+        return
+
     from_user = message.get("from") or {}
     sender_id = from_user.get("id") or chat_id
     tg_username = str(from_user.get("username") or "").strip()
@@ -2543,12 +2949,13 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     raw_text = str(message.get("text") or message.get("caption") or "").strip()
     contact_obj = message.get("contact") if isinstance(message.get("contact"), dict) else {}
     contact_phone = str(contact_obj.get("phone_number") or "").strip()
+    contact_user_id = contact_obj.get("user_id")
+    is_verified_own_contact = bool(contact_phone and contact_user_id and str(contact_user_id) == str(sender_id))
     file_id = _extract_photo_file_id(message)
 
     is_super = is_superadmin_user(sender_id, chat_id)
     is_adm = is_admin_user(sender_id, chat_id)
 
-    # Команды суперадмина по назначению / снятию админов
     if raw_text.startswith("/addadmin"):
         if not is_super:
             await send_ephemeral_text(chat_id, "Назначать админов может только суперадмин.")
@@ -2576,12 +2983,23 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         await tg_send_text(chat_id, f"🗑 Админ удалён. Текущий список: {', '.join(admins_list)}")
         return
 
+    if raw_text.startswith("/unbind") and is_super:
+        parts = raw_text.split(maxsplit=1)
+        if len(parts) < 2 or len(re.sub(r"\D", "", parts[1])) < 10:
+            await send_ephemeral_text(chat_id, "Формат: /unbind <номер_телефона>")
+            return
+        target_p = normalize_phone(parts[1].strip())
+        if unbind_phone_owner(target_p):
+            await tg_send_text(chat_id, f"🔓 Привязка номера {target_p} сброшена.", reply_markup=kb_admin_menu(True))
+        else:
+            await send_ephemeral_text(chat_id, f"Номер {target_p} не был привязан.", reply_markup=kb_admin_menu(True))
+        return
+
     if raw_text.strip().lower() == "/admins" and is_adm:
         admins_list = load_admin_config()["admins"]
         await tg_send_text(chat_id, f"👥 Админы: {', '.join(admins_list)}\nСуперадмин: {SUPERADMIN_ID}")
         return
 
-    # Согласование точечного уведомления о повышенном спросе (только суперадмин)
     if raw_text.startswith("/approve_demand"):
         if not is_super:
             await send_ephemeral_text(chat_id, "Подтверждать рассылку по спросу может только суперадмин.")
@@ -2613,7 +3031,6 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         )
         return
 
-    # Команды оператора / админа по чатам
     if raw_text.lower() in ("/exit", "/stopchat") and is_adm:
         closed_courier = clear_operator_active_courier(chat_id)
         if closed_courier:
@@ -2652,7 +3069,8 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             await send_ephemeral_text(chat_id, "Формат: /period <количество_дней>")
             return
         new_p = set_admin_period_days(int(parts[1].strip()))
-        await tg_send_text(chat_id, f"✅ Период обновлён: {new_p} дн.\n\n{build_admin_summary_text(new_p)}", reply_markup=kb_admin_menu(is_super))
+        summary_txt = await build_admin_summary_text(new_p)
+        await tg_send_text(chat_id, f"✅ Период обновлён: {new_p} дн.\n\n{summary_txt}", reply_markup=kb_admin_menu(is_super))
         return
 
     if raw_text.startswith("/broadcast ") and is_adm:
@@ -2674,10 +3092,9 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         await _deliver_operator_message_to_courier(chat_id, active_courier_for_op, raw_text, file_id)
         return
 
-    save_user_session(chat_id, phone=contact_phone, username=tg_username, full_name=contact_name)
+    save_user_session(chat_id, username=tg_username, full_name=contact_name)
     norm_cmd = normalize_choice_text(raw_text)
 
-    # Кнопка «⬅️ В начало» на любом этапе возвращает на самый первый шаг
     if raw_text == "/start" or norm_cmd in ("в начало", "главное меню", "старт", "start", "меню"):
         await send_start_menu(chat_id, first_name=first_name)
         return
@@ -2686,7 +3103,6 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     step = state.get("step")
     data = state.get("data") or {}
 
-    # Обработка состояния «остались вопросы?» после отмены подключения
     if step == "cancel_ask_questions":
         if norm_cmd in ("да", "yes", "остались"):
             clear_user_state(chat_id)
@@ -2738,7 +3154,6 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         )
         return
 
-    # Состояние ввода текста для массовой рассылки из админки
     if step == "admin_waiting_broadcast" and is_adm:
         clear_user_state(chat_id)
         if not raw_text:
@@ -2757,7 +3172,18 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         )
         return
 
-    # Кнопка «❓ Помощь» доступна на любом этапе
+    if step == "admin_waiting_unbind" and is_super:
+        clear_user_state(chat_id)
+        if len(re.sub(r"\D", "", raw_text)) < 10:
+            await send_ephemeral_text(chat_id, "Некорректный номер.", reply_markup=kb_admin_menu(True))
+            return
+        target_p = normalize_phone(raw_text)
+        if unbind_phone_owner(target_p):
+            await tg_send_text(chat_id, f"🔓 Привязка номера {target_p} сброшена.", reply_markup=kb_admin_menu(True))
+        else:
+            await send_ephemeral_text(chat_id, f"Номер {target_p} не был привязан.", reply_markup=kb_admin_menu(True))
+        return
+
     if norm_cmd in ("помощь", "нужна помощь", "поддержка", "оператор"):
         prev_step = state.get("step")
         prev_data = state.get("data") or {}
@@ -2769,7 +3195,6 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         )
         return
 
-    # Обработка «❌ Отмена»
     if norm_cmd in ("отмена", "отменить", "cancel"):
         if step == "help_waiting_problem" and data.get("prev_step"):
             set_user_state(chat_id, data["prev_step"], data.get("prev_data") or {})
@@ -2786,10 +3211,11 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         await send_start_menu(chat_id, first_name=first_name)
         return
 
-    # Раздел админки
     if is_adm and norm_cmd in ("админка", "сводка за период", "период"):
+        await send_ephemeral_text(chat_id, "Собираю сводку и лайв-статус курьеров на линии...", reply_markup=kb_admin_menu(is_super), ttl_sec=8)
         p_days = get_admin_period_days()
-        await tg_send_text(chat_id, build_admin_summary_text(p_days), reply_markup=kb_admin_menu(is_super))
+        summary_txt = await build_admin_summary_text(p_days)
+        await tg_send_text(chat_id, summary_txt, reply_markup=kb_admin_menu(is_super))
         return
 
     if is_adm and norm_cmd in ("заказы в час", "заказыв час"):
@@ -2803,6 +3229,15 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         await tg_send_text(
             chat_id,
             "Напиши текст рассылки — он уйдёт всем пользователям бота (или нажми «⬅️ В начало»):",
+            reply_markup=kb_step_with_help(),
+        )
+        return
+
+    if is_super and norm_cmd in ("сбросить привязку", "сброс привязки"):
+        set_user_state(chat_id, "admin_waiting_unbind", {})
+        await tg_send_text(
+            chat_id,
+            "Введи номер телефона курьера, с которого нужно снять привязку к Telegram ID:",
             reply_markup=kb_step_with_help(),
         )
         return
@@ -2892,10 +3327,15 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         return
 
     if norm_cmd in ("уже курьер", "уже курьер парка", "кабинет", "мой кабинет", "сменить номер", "изменить номер аккаунта"):
+        if norm_cmd not in ("сменить номер", "изменить номер аккаунта"):
+            saved_driver = await get_saved_profile_or_redirect(chat_id)
+            if saved_driver:
+                await show_courier_welcome(chat_id, saved_driver)
+                return
         set_user_state(chat_id, "courier_auth_phone", {})
         await send_ephemeral_text(
             chat_id,
-            "Нажми «📱 Отправить номер профиля» или введи номер, привязанный к аккаунту (формат не важен, можно без +):",
+            "Нажми «📱 Отправить номер профиля» для подтверждения аккаунта:",
             reply_markup=kb_courier_phone_auth(),
             ttl_sec=30,
         )
@@ -2917,17 +3357,25 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             async with aiohttp.ClientSession() as session:
                 stats = await _get_driver_orders_stats(session, park, driver["id"], goal_start_dt=goal_start)
         except Exception as exc:
-            await send_ephemeral_text(chat_id, f"Не вышло посчитать бонус: {exc}", reply_markup=kb_courier_cabinet())
+            await send_ephemeral_text(chat_id, f"Не вышло посчитать бонус: {exc}", reply_markup=kb_courier_cabinet(True))
             return
 
         done = stats["completed_goal"]
+        done_7d = stats["completed_7d"]
         left = max(0, GOAL_ORDERS - done)
         filled = min(GOAL_ORDERS, done)
         bar = "🟩" * filled + "⬜" * (GOAL_ORDERS - filled)
         start_str = goal_start.astimezone().strftime("%d.%m.%Y")
-        if left == 0:
-            status_line = f"🎉 Супер! Цель закрыта, бонус +{GOAL_BONUS} ₽ твой!"
-        elif not stats["within_goal_window"]:
+
+        if left == 0 or done_7d >= 10:
+            save_user_session(chat_id, bonus_completed=True)
+            resp_text = (
+                f"🎉 Поздравляем! Цель {GOAL_ORDERS} заказов выполнена — бонус +{GOAL_BONUS} ₽ твой!"
+            )
+            await tg_send_text(chat_id, resp_text, reply_markup=kb_courier_cabinet(show_bonus=False))
+            return
+
+        if not stats["within_goal_window"]:
             status_line = f"Срок {GOAL_DAYS} дней (с {start_str}) уже прошёл."
         else:
             status_line = f"Осталось выполнить {left} заказ(ов) за {GOAL_DAYS} дней (отсчёт с {start_str}) до бонуса +{GOAL_BONUS} ₽ 💪"
@@ -2938,13 +3386,14 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             f"{bar}\n\n"
             f"{status_line}"
         )
-        await tg_send_text(chat_id, resp_text, reply_markup=kb_courier_cabinet())
+        await tg_send_text(chat_id, resp_text, reply_markup=kb_courier_cabinet(show_bonus=True))
         return
 
     if norm_cmd in ("корректировки", "штрафы", "мои корректировки", "выгрузить штрафы"):
         driver = await get_saved_profile_or_redirect(chat_id)
         if not driver:
             return
+        show_bonus = await should_show_bonus_button(chat_id, driver)
         park = get_park_by_id(driver["park_id"])
         try:
             async with aiohttp.ClientSession() as session:
@@ -2953,24 +3402,45 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             lines = []
 
         if not lines:
-            await tg_send_text(chat_id, "Корректировок и списаний нет.", reply_markup=kb_courier_cabinet())
+            await tg_send_text(chat_id, "Корректировок и списаний нет.", reply_markup=kb_courier_cabinet(show_bonus=show_bonus))
             return
 
-        await tg_send_text(chat_id, "\n".join(lines), reply_markup=kb_courier_cabinet())
+        await tg_send_text(chat_id, "\n".join(lines), reply_markup=kb_courier_cabinet(show_bonus=show_bonus))
         return
 
     if step == "courier_auth_phone":
+        if contact_phone and not is_verified_own_contact and not is_adm:
+            await record_auth_attempt(
+                chat_id,
+                success=False,
+                reason="передан чужой контакт",
+                tg_username=tg_username,
+                tried_phone=normalize_phone(contact_phone),
+            )
+            await send_ephemeral_text(
+                chat_id,
+                "🛡 Нужно отправить именно свой контакт через кнопку «📱 Отправить номер профиля».",
+                reply_markup=kb_courier_phone_auth(),
+                ttl_sec=15,
+            )
+            return
+
         raw_phone = contact_phone or raw_text
         if len(re.sub(r"\D", "", raw_phone)) < 10:
             await send_ephemeral_text(
                 chat_id,
-                "Введи номер (можно без +, формат не важен) или нажми кнопку отправки номера:",
+                "Нажми кнопку «📱 Отправить номер профиля» или введи свой привязанный номер:",
                 reply_markup=kb_courier_phone_auth(),
                 ttl_sec=15,
             )
             return
         clear_user_state(chat_id)
-        await lookup_and_route_phone(chat_id, normalize_phone(raw_phone), used_contact_button=bool(contact_phone))
+        await lookup_and_route_phone(
+            chat_id,
+            normalize_phone(raw_phone),
+            used_contact_button=is_verified_own_contact,
+            tg_username=tg_username,
+        )
         return
 
     if step == "courier_pick_profile":
@@ -2978,7 +3448,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             set_user_state(chat_id, "courier_auth_phone", {})
             await send_ephemeral_text(
                 chat_id,
-                "Нажми «📱 Отправить номер профиля» или введи номер вручную:",
+                "Нажми «📱 Отправить номер профиля»:",
                 reply_markup=kb_courier_phone_auth(),
                 ttl_sec=25,
             )
@@ -3047,14 +3517,20 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "reg_name", data)
         await tg_send_text(
             chat_id,
-            "Шаг 3. Как тебя зовут? Напиши Фамилию и Имя:",
+            "Шаг 3. Ваши ФИО полностью (например: Иванов Иван Иванович):",
             reply_markup=kb_step_with_help(),
         )
         return
 
     if step == "reg_name":
-        if len(raw_text) < 2:
-            await send_ephemeral_text(chat_id, "Напиши свои Фамилию и Имя:", reply_markup=kb_step_with_help(), ttl_sec=15)
+        parts = [p for p in raw_text.split() if p]
+        if len(parts) < 2 or len(raw_text) < 5:
+            await send_ephemeral_text(
+                chat_id,
+                "Укажите Ваши ФИО полностью (например: Иванов Иван Иванович):",
+                reply_markup=kb_step_with_help(),
+                ttl_sec=15,
+            )
             return
         data = update_user_state_data(chat_id, name=raw_text)
         if data.get("return_to_confirm"):
@@ -3125,15 +3601,6 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             )
             return
         data = update_user_state_data(chat_id, sts_front_file_id=file_id)
-        if data.get("editing_single_doc") == "sts_front":
-            data.pop("editing_single_doc", None)
-            set_user_state(chat_id, "reg_sts_back", data)
-            await tg_send_text(
-                chat_id,
-                "Теперь пришли фото обратной стороны СТС (2 из 2):",
-                reply_markup=kb_step_with_help(),
-            )
-            return
         set_user_state(chat_id, "reg_sts_back", data)
         await tg_send_text(
             chat_id,
@@ -3227,9 +3694,9 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             set_user_state(chat_id, "reg_city", data)
             await tg_send_text(chat_id, "Введи новый город:", reply_markup=kb_step_with_help())
             return
-        if norm_cmd in ("изменить имя", "имя"):
+        if norm_cmd in ("изменить фио", "фио", "изменить имя", "имя"):
             set_user_state(chat_id, "reg_name", data)
-            await tg_send_text(chat_id, "Введи новые Фамилию и Имя:", reply_markup=kb_step_with_help())
+            await tg_send_text(chat_id, "Укажите Ваши ФИО полностью (например: Иванов Иван Иванович):", reply_markup=kb_step_with_help())
             return
         if norm_cmd in ("изменить телефон", "телефон"):
             set_user_state(chat_id, "reg_phone", data)
@@ -3296,6 +3763,10 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def handle_tg_webhook(request: web.Request) -> web.Response:
+    if TELEGRAM_WEBHOOK_SECRET:
+        hdr_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(hdr_secret, TELEGRAM_WEBHOOK_SECRET):
+            return web.json_response({"ok": False}, status=403)
     try:
         upd = await request.json()
         if isinstance(upd, dict):
@@ -3315,8 +3786,11 @@ async def on_startup(app: web.Application) -> None:
 
     async with aiohttp.ClientSession() as session:
         if TELEGRAM_WEBHOOK_URL:
-            await tg_api(session, "setWebhook", {"url": TELEGRAM_WEBHOOK_URL})
-            logger.info("Установлен Telegram webhook: %s", TELEGRAM_WEBHOOK_URL)
+            wh_payload: dict[str, Any] = {"url": TELEGRAM_WEBHOOK_URL}
+            if TELEGRAM_WEBHOOK_SECRET:
+                wh_payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+            await tg_api(session, "setWebhook", wh_payload)
+            logger.info("Установлен Telegram webhook")
         else:
             await tg_api(session, "deleteWebhook", {"drop_pending_updates": False})
             app["polling_task"] = asyncio.create_task(polling_loop())
