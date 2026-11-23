@@ -17,6 +17,16 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9247740629:AAE96VCZow9OgTf
 TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
+# Telegram ID операторов / администраторов (через запятую в env, например "123456789,987654321")
+# Если оставить пустым — команды /chat, /exit, /reply будут доступны из любого чата, где их напишут
+_raw_admins = os.getenv("OPERATOR_ADMIN_IDS", "").strip()
+OPERATOR_ADMIN_IDS: set[str] = {
+    x.strip() for x in _raw_admins.split(",") if x.strip()
+}
+
+# Опционально: ID чата/группы операторов, куда бот будет дублировать обращения из «Помощи» и ответы курьеров
+OPERATOR_CHAT_ID = os.getenv("OPERATOR_CHAT_ID", "").strip()
+
 # Основной парк (Яндекс Fleet API)
 PARKS_CONFIG: list[dict[str, str]] = [
     {
@@ -54,6 +64,7 @@ DRIVERS_CACHE_FILE = "drivers_cache.json"
 CLIENT_LEADS_FILE = "client_leads.json"
 STATES_FILE = "user_states.json"
 DELAYED_TASKS_FILE = "delayed_notifications.json"
+LIVE_CHATS_FILE = "live_chats.json"
 
 FLEET_API_URL = "https://fleet-api.taxi.yandex.net"
 
@@ -267,6 +278,82 @@ def requires_two_sided_sts(transport_text: str) -> bool:
     return any(k in low for k in STS_TRANSPORT_KEYWORDS)
 
 
+def is_operator_user(user_id: int | str, chat_id: int | str) -> bool:
+    if not OPERATOR_ADMIN_IDS:
+        return False
+    return str(user_id) in OPERATOR_ADMIN_IDS or str(chat_id) in OPERATOR_ADMIN_IDS
+
+
+# ================= ЖИВОЙ ДИАЛОГ ОПЕРАТОР <-> КУРЬЕР =================
+def load_live_chats() -> dict[str, Any]:
+    raw = _read_json(LIVE_CHATS_FILE, {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_live_chats(data: dict[str, Any]) -> None:
+    _write_json(LIVE_CHATS_FILE, data)
+
+
+def set_operator_active_courier(operator_chat_id: int | str, courier_chat_id: int | str) -> None:
+    data = load_live_chats()
+    active_by_op = data.get("active_by_op") if isinstance(data.get("active_by_op"), dict) else {}
+    courier_to_op = data.get("courier_to_op") if isinstance(data.get("courier_to_op"), dict) else {}
+
+    op_key = str(operator_chat_id)
+    prev_courier = active_by_op.get(op_key)
+    if prev_courier and courier_to_op.get(str(prev_courier)) == op_key:
+        courier_to_op.pop(str(prev_courier), None)
+
+    c_key = str(courier_chat_id)
+    active_by_op[op_key] = c_key
+    courier_to_op[c_key] = op_key
+    data["active_by_op"] = active_by_op
+    data["courier_to_op"] = courier_to_op
+    save_live_chats(data)
+
+
+def clear_operator_active_courier(operator_chat_id: int | str) -> str | None:
+    data = load_live_chats()
+    active_by_op = data.get("active_by_op") if isinstance(data.get("active_by_op"), dict) else {}
+    courier_to_op = data.get("courier_to_op") if isinstance(data.get("courier_to_op"), dict) else {}
+
+    op_key = str(operator_chat_id)
+    prev_courier = active_by_op.pop(op_key, None)
+    if prev_courier and courier_to_op.get(str(prev_courier)) == op_key:
+        courier_to_op.pop(str(prev_courier), None)
+
+    data["active_by_op"] = active_by_op
+    data["courier_to_op"] = courier_to_op
+    save_live_chats(data)
+    return str(prev_courier) if prev_courier else None
+
+
+def get_operator_active_courier(operator_chat_id: int | str) -> str | None:
+    data = load_live_chats()
+    active_by_op = data.get("active_by_op") if isinstance(data.get("active_by_op"), dict) else {}
+    val = active_by_op.get(str(operator_chat_id))
+    return str(val) if val else None
+
+
+def get_courier_active_operator(courier_chat_id: int | str) -> str | None:
+    data = load_live_chats()
+    courier_to_op = data.get("courier_to_op") if isinstance(data.get("courier_to_op"), dict) else {}
+    val = courier_to_op.get(str(courier_chat_id))
+    return str(val) if val else None
+
+
+def get_last_help_courier() -> str | None:
+    data = load_live_chats()
+    val = data.get("last_help_courier")
+    return str(val) if val else None
+
+
+def set_last_help_courier(courier_chat_id: int | str) -> None:
+    data = load_live_chats()
+    data["last_help_courier"] = str(courier_chat_id)
+    save_live_chats(data)
+
+
 def get_user_state(chat_id: int | str) -> dict[str, Any]:
     states = _read_json(STATES_FILE, {})
     raw = states.get(str(chat_id))
@@ -413,6 +500,28 @@ async def tg_send_text(
             return bool(res.get("ok"))
     except Exception as exc:
         logger.exception("Ошибка отправки сообщения в Telegram: %s", exc)
+        return False
+
+
+async def tg_send_photo(
+    chat_id: int | str,
+    file_id: str,
+    caption: str = "",
+) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not file_id:
+        return False
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "photo": file_id,
+    }
+    if caption:
+        payload["caption"] = caption
+    try:
+        async with aiohttp.ClientSession() as session:
+            res = await tg_api(session, "sendPhoto", payload)
+            return bool(res.get("ok"))
+    except Exception as exc:
+        logger.warning("Ошибка отправки фото в Telegram: %s", exc)
         return False
 
 
@@ -733,7 +842,7 @@ async def send_lead_to_amocrm(
             f"Telegram: {tg_login}",
             f"Ссылка на чат: {tg_link}",
             f"Telegram ID: {chat_id}",
-            f"Ответить курьеру: /reply {chat_id} <текст>",
+            f"Живой чат с курьером: /chat {chat_id}",
         ]
 
         try:
@@ -865,7 +974,7 @@ async def send_help_to_amocrm(
             f"Telegram: {tg_login}\n"
             f"Ссылка на чат: {tg_link}\n"
             f"Telegram ID: {chat_id}\n"
-            f"Ответить курьеру: /reply {chat_id} <текст>\n"
+            f"Войти в диалог: /chat {chat_id}\n"
             f"Текст проблемы:\n{problem_text.strip()}"
         )
 
@@ -1432,6 +1541,30 @@ def _extract_photo_file_id(message: dict[str, Any]) -> str:
     return ""
 
 
+async def _deliver_operator_message_to_courier(
+    operator_chat_id: int | str,
+    courier_chat_id: str,
+    raw_text: str,
+    file_id: str,
+) -> None:
+    if file_id:
+        ok = await tg_send_photo(
+            courier_chat_id,
+            file_id,
+            caption=f"💬 Оператор ЛунапаркЕда:\n{raw_text}".strip(),
+        )
+    elif raw_text:
+        ok = await tg_send_text(courier_chat_id, f"💬 Оператор ЛунапаркЕда:\n\n{raw_text}")
+    else:
+        await tg_send_text(operator_chat_id, "Отправьте текст или фото для курьера.")
+        return
+
+    if ok:
+        await tg_send_text(operator_chat_id, f"✅ Отправлено курьеру ({courier_chat_id}). Для выхода: /exit")
+    else:
+        await tg_send_text(operator_chat_id, f"⚠️ Не удалось доставить сообщение курьеру ({courier_chat_id}).")
+
+
 async def handle_telegram_update(update: dict[str, Any]) -> None:
     if not isinstance(update, dict):
         return
@@ -1446,6 +1579,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         return
 
     from_user = message.get("from") or {}
+    sender_id = from_user.get("id") or chat_id
     tg_username = str(from_user.get("username") or "").strip()
     first_name = str(from_user.get("first_name") or chat.get("first_name") or "друг").strip()
     last_name = str(from_user.get("last_name") or "").strip()
@@ -1456,19 +1590,48 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     contact_phone = str(contact_obj.get("phone_number") or "").strip()
     file_id = _extract_photo_file_id(message)
 
-    # Команда прямого ответа курьеру из бота: /reply <target_chat_id> <текст>
-    if raw_text.startswith("/reply "):
+    can_use_operator_cmds = (not OPERATOR_ADMIN_IDS) or is_operator_user(sender_id, chat_id)
+
+    # Команда выхода из живого чата с курьером: /exit
+    if raw_text.lower() in ("/exit", "/stopchat") and can_use_operator_cmds:
+        closed_courier = clear_operator_active_courier(chat_id)
+        if closed_courier:
+            await tg_send_text(chat_id, f"🔒 Диалог с курьером ({closed_courier}) завершён.")
+        else:
+            await tg_send_text(chat_id, "Сейчас нет активного диалога с курьером.")
+        return
+
+    # Команда входа в живой диалог с курьером: /chat <chat_id> (или /chat без аргументов — к последнему обратившемуся)
+    if raw_text.startswith("/chat") and can_use_operator_cmds:
+        parts = raw_text.split(maxsplit=1)
+        target_cid = parts[1].strip() if len(parts) > 1 and parts[1].strip() else (get_last_help_courier() or "")
+        if not target_cid or not target_cid.lstrip("-").isdigit():
+            await tg_send_text(chat_id, "Укажите chat_id курьера: /chat <chat_id>")
+            return
+        set_operator_active_courier(chat_id, target_cid)
+        rec = get_user_record(target_cid)
+        c_name = rec.get("full_name") or f"id{target_cid}"
+        c_login = format_tg_login(target_cid, rec.get("username"))
+        await tg_send_text(
+            chat_id,
+            f"💬 Открыт живой чат с курьером: {c_name} ({c_login}, ID: {target_cid}).\n"
+            "Теперь все ваши следующие сообщения уходят напрямую ему. Чтобы выйти — напишите /exit.",
+        )
+        return
+
+    # Быстрый разовый ответ курьеру: /reply <chat_id> <текст>
+    if raw_text.startswith("/reply ") and can_use_operator_cmds:
         parts = raw_text.split(maxsplit=2)
         if len(parts) < 3 or not parts[1].lstrip("-").isdigit():
-            await tg_send_text(chat_id, "Формат команды: /reply <chat_id> <текст ответа курьеру>")
+            await tg_send_text(chat_id, "Формат: /reply <chat_id> <текст ответа>")
             return
-        target_chat_id = parts[1].strip()
-        reply_body = parts[2].strip()
-        sent_ok = await tg_send_text(target_chat_id, f"💬 Сообщение от парка ЛунапаркЕда:\n\n{reply_body}")
-        if sent_ok:
-            await tg_send_text(chat_id, f"✅ Ответ отправлен пользователю {target_chat_id}.")
-        else:
-            await tg_send_text(chat_id, f"⚠️ Не удалось отправить сообщение пользователю {target_chat_id}.")
+        await _deliver_operator_message_to_courier(chat_id, parts[1].strip(), parts[2].strip(), "")
+        return
+
+    # Если оператор уже находится в активном живом чате с курьером (и не нажал /start или кнопку меню)
+    active_courier_for_op = get_operator_active_courier(chat_id)
+    if active_courier_for_op and raw_text not in ("/start",) and not raw_text.startswith("/"):
+        await _deliver_operator_message_to_courier(chat_id, active_courier_for_op, raw_text, file_id)
         return
 
     save_user_session(chat_id, phone=contact_phone, username=tg_username, full_name=contact_name)
@@ -1486,7 +1649,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "help_waiting_problem", {"prev_step": prev_step, "prev_data": prev_data})
         await tg_send_text(
             chat_id,
-            "Добрый день! Опишите Вашу проблему — мы передадим её в amoCRM и ответим вам здесь.",
+            "Добрый день! Напишите ваш вопрос — подключим оператора и ответим вам здесь.",
             reply_markup=kb_step_with_help(),
         )
         return
@@ -1513,6 +1676,11 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             return
         problem_body = raw_text or "[Прикреплено фото / файл]"
         set_user_state(chat_id, data.get("prev_step"), data.get("prev_data") or {})
+        set_last_help_courier(chat_id)
+
+        tg_login = format_tg_login(chat_id, tg_username)
+        tg_link = format_tg_link(chat_id, tg_username)
+        phone = get_user_record(chat_id).get("phone") or "—"
 
         await send_help_to_amocrm(
             problem_text=problem_body,
@@ -1520,12 +1688,46 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             tg_username=tg_username,
             full_name=contact_name,
         )
+
+        op_card = (
+            "🆘 Новое обращение «Помощь»\n\n"
+            f"👤 Имя: {contact_name}\n"
+            f"📱 Телефон: {phone}\n"
+            f"💬 Telegram: {tg_login} ({tg_link})\n"
+            f"🆔 chat_id: {chat_id}\n\n"
+            f"Текст:\n{problem_body}\n\n"
+            f"👉 Войти в живой чат: /chat {chat_id}"
+        )
+
+        notified_targets: set[str] = set()
+        if OPERATOR_CHAT_ID:
+            notified_targets.add(OPERATOR_CHAT_ID)
+        for admin_id in OPERATOR_ADMIN_IDS:
+            notified_targets.add(admin_id)
+
+        for target in notified_targets:
+            if str(target) == str(chat_id):
+                continue
+            await tg_send_text(target, op_card)
+            if file_id:
+                await tg_send_photo(target, file_id, caption=f"Вложение от {contact_name} (ID: {chat_id})")
+
         await tg_send_text(
             chat_id,
-            "Получили ваше сообщение, скоро ответим.",
+            "Обращение принято! Оператор скоро ответит вам прямо здесь.",
             reply_markup=kb_start_menu(),
         )
         return
+
+    # Если курьер уже привязан к живому диалогу с оператором — пересылаем его сообщения оператору
+    bound_operator = get_courier_active_operator(chat_id)
+    if bound_operator:
+        tg_login = format_tg_login(chat_id, tg_username)
+        msg_for_op = f"📩 Сообщение от курьера {contact_name} ({tg_login}, ID: {chat_id}):\n\n{raw_text}".strip()
+        if file_id:
+            await tg_send_photo(bound_operator, file_id, caption=msg_for_op)
+        elif raw_text:
+            await tg_send_text(bound_operator, msg_for_op)
 
     if norm_cmd in ("подключиться", "подключиться к парку", "регистрация", "стать курьером"):
         set_user_state(chat_id, "reg_transport", {"return_to_confirm": False})
