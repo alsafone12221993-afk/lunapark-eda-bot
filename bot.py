@@ -13,19 +13,18 @@ import aiohttp
 from aiohttp import web
 
 # ================= КОНФИГУРАЦИЯ =================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9247740629:AAE96VCZow9OgTfpL6XHtLL0pJQFncawyO4").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9247740629:AAG9pvz304fqYA_3kLsG79oSA-k2mY7aYCw").strip()
 TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
-# Telegram ID операторов / администраторов (через запятую в env, например "673430213,123456789")
-# Если оставить пустым — команды /chat, /exit, /reply будут доступны из любого чата, где их напишут
-_raw_admins = os.getenv("OPERATOR_ADMIN_IDS", "").strip()
+# Telegram ID операторов / администраторов
+_raw_admins = os.getenv("OPERATOR_ADMIN_IDS", "673430213").strip()
 OPERATOR_ADMIN_IDS: set[str] = {
     x.strip() for x in _raw_admins.split(",") if x.strip()
 }
 
-# Опционально: ID чата/группы операторов, куда бот будет дублировать обращения из «Помощи» и ответы курьеров
-OPERATOR_CHAT_ID = os.getenv("OPERATOR_CHAT_ID", "").strip()
+# ID чата/группы операторов для уведомлений по «Помощи» и живых диалогов
+OPERATOR_CHAT_ID = os.getenv("OPERATOR_CHAT_ID", "673430213").strip()
 
 # Основной парк (Яндекс Fleet API)
 PARKS_CONFIG: list[dict[str, str]] = [
