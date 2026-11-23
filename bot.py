@@ -3264,7 +3264,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if unbind_phone_owner(target_p):
             await tg_send_text(chat_id, f"🔓 Привязка номера {target_p} сброшена.", reply_markup=kb_admin_menu(True))
         else:
-            await send_ephemeral_text(chat_id, f"Номер {target_p} не был привязан.", reply_markup=kb_admin_menu(True))
+            await tg_send_text(chat_id, f"Номер {target_p} не был привязан.", reply_markup=kb_admin_menu(True))
         return
 
     if raw_text.strip().lower() == "/admins" and is_adm:
@@ -3375,7 +3375,6 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     step = state.get("step")
     data = state.get("data") or {}
 
-    # Ожидаем ввод количества дней периода из кнопки «🗓 Период»
     if step == "admin_waiting_period" and is_adm:
         clear_user_state(chat_id)
         if not raw_text.isdigit():
@@ -3416,7 +3415,6 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             await send_ephemeral_text(chat_id, f"Номер {target_p} не был привязан.", reply_markup=kb_admin_menu(True))
         return
 
-    # Кнопки админки и суперадмина (обрабатываем строго до общих сценариев)
     if is_adm and norm_cmd in ("админка", "сводка за период"):
         clear_user_state(chat_id)
         await send_ephemeral_text(chat_id, "Собираю сводку и лайв-статус курьеров...", reply_markup=kb_admin_menu(is_super), ttl_sec=8)
@@ -4032,8 +4030,63 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     await send_start_menu(chat_id, first_name=first_name)
 
 
+async def _fetch_latest_amocrm_note_text(
+    lead_id: str | None = None,
+    contact_id: str | None = None,
+) -> str:
+    """Дочитывает последнее примечание из сделки или контакта в amoCRM через API."""
+    if not AMOCRM_BASE_URL or not AMOCRM_ACCESS_TOKEN:
+        return ""
+    base_url = AMOCRM_BASE_URL.rstrip("/")
+    targets: list[str] = []
+    if lead_id and str(lead_id).isdigit():
+        targets.append(f"{base_url}/api/v4/leads/{lead_id}/notes")
+    if contact_id and str(contact_id).isdigit():
+        targets.append(f"{base_url}/api/v4/contacts/{contact_id}/notes")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            for url in targets:
+                async with session.get(
+                    url,
+                    params={"limit": 5, "order[created_at]": "desc"},
+                    headers=_amocrm_headers(),
+                    timeout=15,
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    notes = data.get("_embedded", {}).get("notes", []) or []
+                    for n in notes:
+                        if not isinstance(n, dict):
+                            continue
+                        txt = str((n.get("params") or {}).get("text") or n.get("text") or "").strip()
+                        if not txt:
+                            continue
+                        if txt.startswith("Парк: ЛунапаркЕда") or txt.startswith("Обращение по кнопке"):
+                            continue
+                        return txt
+    except Exception as exc:
+        logger.warning("Не удалось дочитать примечание из amoCRM: %s", exc)
+    return ""
+
+
+def _extract_reply_from_note(raw_note: str) -> str:
+    txt = (raw_note or "").strip()
+    if not txt:
+        return ""
+    if txt.startswith("Парк: ЛунапаркЕда") or txt.startswith("Обращение по кнопке"):
+        return ""
+    low = txt.lower()
+    if low.startswith("tg:"):
+        return txt[3:].strip()
+    if low.startswith("ответ:"):
+        return txt[6:].strip()
+    return ""
+
+
 async def handle_amocrm_webhook(request: web.Request) -> web.Response:
-    """Приём вебхуков из amoCRM (например, новое примечание к сделке/контакту) для ответа курьеру."""
+    """Приём вебхуков из amoCRM и отправка ответа курьеру в Telegram."""
     if AMOCRM_WEBHOOK_SECRET:
         secret = request.query.get("secret") or request.headers.get("X-AmoCRM-Secret", "")
         if not hmac.compare_digest(secret, AMOCRM_WEBHOOK_SECRET):
@@ -4053,15 +4106,21 @@ async def handle_amocrm_webhook(request: web.Request) -> web.Response:
         return web.json_response({"ok": False}, status=400)
 
     if isinstance(payload, dict):
-        # Поддержка разных форматов вебхуков amoCRM (leads/contacts note или кастомный JSON)
         lead_id = str(payload.get("lead_id") or "") or None
         contact_id = str(payload.get("contact_id") or "") or None
         note_text = str(payload.get("text") or payload.get("note_text") or "").strip()
 
+        for k, v in payload.items():
+            ks = str(k)
+            if not lead_id and ("leads[" in ks) and ks.endswith("[id]") and str(v).isdigit():
+                lead_id = str(v)
+            if not contact_id and ("contacts[" in ks) and ks.endswith("[id]") and str(v).isdigit():
+                contact_id = str(v)
+
         for ent_key, id_attr in (("leads", "lead_id"), ("contacts", "contact_id")):
             ent_block = payload.get(ent_key)
             if isinstance(ent_block, dict):
-                for action_name in ("add", "update", "note"):
+                for action_name in ("add", "update", "status", "note"):
                     act_list = ent_block.get(action_name)
                     if isinstance(act_list, dict):
                         act_list = list(act_list.values())
@@ -4069,34 +4128,28 @@ async def handle_amocrm_webhook(request: web.Request) -> web.Response:
                         first = act_list[0]
                         if isinstance(first, dict):
                             eid = first.get("id") or first.get("element_id")
-                            if eid and id_attr == "lead_id":
+                            if eid and id_attr == "lead_id" and not lead_id:
                                 lead_id = str(eid)
-                            elif eid and id_attr == "contact_id":
+                            elif eid and id_attr == "contact_id" and not contact_id:
                                 contact_id = str(eid)
                             notes = first.get("notes")
-                            if isinstance(notes, list) and notes and isinstance(notes[0], dict):
+                            if isinstance(notes, list) and notes and isinstance(notes[0], dict) and not note_text:
                                 note_text = str((notes[0].get("params") or {}).get("text") or notes[0].get("text") or "").strip()
 
-    if not note_text:
-        return web.json_response({"ok": True, "ignored": "empty_text"})
-
-    # Игнорируем служебные примечания самого бота
-    if note_text.startswith("Парк: ЛунапаркЕда") or note_text.startswith("Обращение по кнопке"):
-        return web.json_response({"ok": True, "ignored": "bot_note"})
-
-    # Поддержка префикса "tg:" или "ответ:" чтобы случайно не отправить внутренние заметки менеджеров
-    clean_reply = note_text
-    if note_text.lower().startswith("tg:"):
-        clean_reply = note_text[3:].strip()
-    elif note_text.lower().startswith("ответ:"):
-        clean_reply = note_text[6:].strip()
-
     target_tg_id = find_tg_chat_by_crm_entity(lead_id=lead_id, contact_id=contact_id)
-    if target_tg_id and clean_reply:
-        await tg_send_text(target_tg_id, f"💬 Сообщение от менеджера парка:\n\n{clean_reply}")
-        return web.json_response({"ok": True, "sent_to": target_tg_id})
+    if not target_tg_id:
+        return web.json_response({"ok": True, "ignored": "no_tg_binding", "lead_id": lead_id, "contact_id": contact_id})
 
-    return web.json_response({"ok": True, "ignored": "no_tg_binding"})
+    clean_reply = _extract_reply_from_note(note_text)
+    if not clean_reply:
+        fetched_note = await _fetch_latest_amocrm_note_text(lead_id=lead_id, contact_id=contact_id)
+        clean_reply = _extract_reply_from_note(fetched_note)
+
+    if not clean_reply:
+        return web.json_response({"ok": True, "ignored": "no_tg_or_reply_prefix"})
+
+    sent_mid = await tg_send_text(target_tg_id, f"💬 Сообщение от менеджера парка:\n\n{clean_reply}")
+    return web.json_response({"ok": bool(sent_mid), "sent_to": target_tg_id})
 
 
 async def polling_loop() -> None:
@@ -4182,6 +4235,7 @@ def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", handle_health)
     app.router.add_get("/health", handle_health)
+    app.router.add_post("/", handle_amocrm_webhook)
     app.router.add_post("/webhook/telegram", handle_tg_webhook)
     app.router.add_post("/webhook/amocrm", handle_amocrm_webhook)
     app.on_startup.append(on_startup)
