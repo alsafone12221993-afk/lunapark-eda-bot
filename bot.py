@@ -35,6 +35,11 @@ OPERATOR_CHAT_ID = os.getenv("OPERATOR_CHAT_ID", SUPERADMIN_ID).strip()
 # Порог почасового спроса по умолчанию
 DEMAND_RATE_RUB_PER_HOUR = int(os.getenv("DEMAND_RATE_RUB_PER_HOUR", "800"))
 
+# Защита от перебора номеров при входе в кабинет
+AUTH_MAX_ATTEMPTS = 5
+AUTH_WINDOW_SEC = 600
+AUTH_LOCK_SEC = 900
+
 # Основной парк (Яндекс Fleet API)
 PARKS_CONFIG: list[dict[str, str]] = [
     {
@@ -76,13 +81,14 @@ LIVE_CHATS_FILE = "live_chats.json"
 EPHEMERAL_MSGS_FILE = "ephemeral_messages.json"
 ADMIN_CONFIG_FILE = "admin_config.json"
 PENDING_DEMANDS_FILE = "pending_demands.json"
+AUTH_GUARD_FILE = "auth_guard.json"
 
 FLEET_API_URL = "https://fleet-api.taxi.yandex.net"
 
 GOAL_ORDERS = 5
 GOAL_DAYS = 14
 GOAL_BONUS = 500
-PROFILE_READY_DELAY_SEC = 600
+PROFILE_READY_DELAY_SEC = 360
 AFTER_10M_REMINDER_DELAY_SEC = 5
 
 DRIVERS_CACHE: dict[str, dict[str, Any]] = {}
@@ -100,7 +106,7 @@ _FIELDS_CATALOG_CACHE: dict[str, list[dict[str, Any]]] = {}
 _FILE_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 _STATS_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-STS_TRANSPORT_KEYWORDS = ("авто", "мото", "груз")
+VEHICLE_DOCS_KEYWORDS = ("авто", "мото", "груз")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -113,7 +119,7 @@ ANDROID_URL = "https://play.google.com/store/apps/details?id=ru.yandex.taximeter
 RUSTORE_URL = "https://www.rustore.ru/catalog/app/ru.yandex.taximeter"
 
 MSG_AFTER_SUBMIT = (
-    "✅ Заявка принята! Профиль создадим в течение 10 минут.\n\n"
+    "✅ Заявка принята! Профиль создадим в течение 6 минут.\n\n"
     "Пока можно скачать Яндекс Про:\n"
     f"🍎 <a href=\"{IOS_URL}\">iOS (App Store)</a>\n"
     f"🤖 <a href=\"{ANDROID_URL}\">Android (Google Play)</a>\n"
@@ -132,7 +138,7 @@ MSG_PROFILE_CREATED_10M = (
 )
 
 MSG_AFTER_10M_CABINET_HINT = (
-    "💡 Чтобы смотреть статистику, цели и корректировки в боте, нажми «✅ Уже курьер»."
+    "💡 Чтобы смотреть статистику, бонус и корректировки в боте, нажми «✅ Уже курьер»."
 )
 
 
@@ -228,9 +234,10 @@ def kb_edit_field_choice(data: dict[str, Any]) -> dict[str, Any]:
     rows: list[list[str | dict[str, Any]]] = [
         ["Изменить формат", "Изменить город"],
         ["Изменить имя", "Изменить телефон"],
+        ["Изменить прописку"],
     ]
-    if requires_two_sided_sts(data.get("transport", "")):
-        rows.append(["Изменить фото СТС"])
+    if requires_vehicle_docs(data.get("transport", "")):
+        rows.append(["Изменить фото СТС", "Изменить фото ВУ"])
     rows.append(["Назад к проверке", "❓ Помощь"])
     rows.append(["❌ Отмена", "⬅️ В начало"])
     return _reply_kb(rows)
@@ -238,7 +245,7 @@ def kb_edit_field_choice(data: dict[str, Any]) -> dict[str, Any]:
 
 def kb_courier_cabinet() -> dict[str, Any]:
     return _reply_kb([
-        ["📊 Моя статистика", "🎁 Цель"],
+        ["📊 Моя статистика", "🎁 Бонус"],
         ["⚖️ Корректировки", "❓ Помощь"],
         ["🔄 Сменить номер", "⬅️ В начало"],
     ])
@@ -342,9 +349,59 @@ def format_tg_link(chat_id: int | str, tg_username: str | None) -> str:
     return f"tg://user?id={chat_id}"
 
 
-def requires_two_sided_sts(transport_text: str) -> bool:
+def requires_vehicle_docs(transport_text: str) -> bool:
     low = (transport_text or "").lower()
-    return any(k in low for k in STS_TRANSPORT_KEYWORDS)
+    return any(k in low for k in VEHICLE_DOCS_KEYWORDS)
+
+
+def _has_all_vehicle_docs(data: dict[str, Any]) -> bool:
+    return bool(
+        data.get("sts_front_file_id")
+        and data.get("sts_back_file_id")
+        and data.get("vu_front_file_id")
+        and data.get("vu_back_file_id")
+    )
+
+
+# ================= ЗАЩИТА ОТ ПЕРЕБОРА НОМЕРОВ ПРИ ВХОДЕ =================
+def check_auth_rate_limit(chat_id: int | str) -> tuple[bool, int]:
+    """Возвращает (разрешено, секунд_до_разблокировки)."""
+    guard = _read_json(AUTH_GUARD_FILE, {})
+    if not isinstance(guard, dict):
+        guard = {}
+    key = str(chat_id)
+    now = time.time()
+    rec = guard.get(key) if isinstance(guard.get(key), dict) else {}
+    locked_until = float(rec.get("locked_until") or 0)
+    if locked_until > now:
+        return False, int(locked_until - now) + 1
+    attempts = [float(t) for t in (rec.get("attempts") or []) if now - float(t) <= AUTH_WINDOW_SEC]
+    rec["attempts"] = attempts
+    rec["locked_until"] = 0
+    guard[key] = rec
+    _write_json(AUTH_GUARD_FILE, guard)
+    return True, 0
+
+
+def record_auth_attempt(chat_id: int | str, success: bool) -> None:
+    guard = _read_json(AUTH_GUARD_FILE, {})
+    if not isinstance(guard, dict):
+        guard = {}
+    key = str(chat_id)
+    now = time.time()
+    if success:
+        guard.pop(key, None)
+        _write_json(AUTH_GUARD_FILE, guard)
+        return
+    rec = guard.get(key) if isinstance(guard.get(key), dict) else {}
+    attempts = [float(t) for t in (rec.get("attempts") or []) if now - float(t) <= AUTH_WINDOW_SEC]
+    attempts.append(now)
+    rec["attempts"] = attempts
+    if len(attempts) >= AUTH_MAX_ATTEMPTS:
+        rec["locked_until"] = now + AUTH_LOCK_SEC
+        rec["attempts"] = []
+    guard[key] = rec
+    _write_json(AUTH_GUARD_FILE, guard)
 
 
 # ================= ПРАВА СУПЕРАДМИНА И АДМИНОВ =================
@@ -532,6 +589,7 @@ def save_user_session(
     park_id: str = "",
     driver_id: str = "",
     city: str = "",
+    address: str = "",
     username: str = "",
     full_name: str = "",
 ) -> dict[str, Any]:
@@ -552,6 +610,8 @@ def save_user_session(
         entry["driver_id"] = driver_id
     if city:
         entry["city"] = city
+    if address:
+        entry["address"] = address
     if username:
         entry["username"] = username.lstrip("@").strip()
     if full_name:
@@ -756,14 +816,16 @@ async def tg_download_file(file_id: str, default_name: str) -> Optional[tuple[by
                 if resp.status != 200:
                     return None
                 raw = await resp.read()
-                fname = os.path.basename(file_path) or default_name
+                ext = os.path.splitext(file_path)[1] or os.path.splitext(default_name)[1] or ".jpg"
+                stem = os.path.splitext(default_name)[0]
+                fname = f"{stem}{ext}"
                 return (raw, fname)
     except Exception as exc:
         logger.warning("Ошибка скачивания файла Telegram %s: %s", file_id, exc)
         return None
 
 
-# ================= ОТЛОЖЕННОЕ СООБЩЕНИЕ ЧЕРЕЗ 10 МИНУТ + ДОП. СООБЩЕНИЕ ЧЕРЕЗ 5 СЕК =================
+# ================= ОТЛОЖЕННОЕ СООБЩЕНИЕ ЧЕРЕЗ 6 МИНУТ + ДОП. СООБЩЕНИЕ ЧЕРЕЗ 5 СЕК =================
 def schedule_delayed_profile_msg(chat_id: int | str, delay_sec: int = PROFILE_READY_DELAY_SEC) -> None:
     tasks = _read_json(DELAYED_TASKS_FILE, [])
     if not isinstance(tasks, list):
@@ -787,7 +849,7 @@ def schedule_delayed_profile_msg(chat_id: int | str, delay_sec: int = PROFILE_RE
 
 
 async def delayed_notifications_worker() -> None:
-    logger.info("Запущен фоновый воркер автосообщений через 10 мин (+5 сек подсказка)")
+    logger.info("Запущен фоновый воркер автосообщений через 6 мин (+5 сек подсказка)")
     while True:
         try:
             async with _FILE_LOCKS["delayed_tasks"]:
@@ -831,6 +893,15 @@ def _amocrm_headers() -> dict[str, str]:
         "Authorization": f"Bearer {AMOCRM_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
+
+
+def _guess_image_mime(fname: str) -> str:
+    low = (fname or "").lower()
+    if low.endswith(".png"):
+        return "image/png"
+    if low.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
 
 
 async def _get_custom_fields_catalog(
@@ -1015,57 +1086,73 @@ async def _find_or_create_contact_id(
     return None
 
 
-async def _upload_and_attach_sts(
+async def _upload_and_attach_docs(
     session: aiohttp.ClientSession,
     base_url: str,
     lead_id: int | None,
     contact_id: int | None,
-    sts_front: Optional[tuple[bytes, str]],
-    sts_back: Optional[tuple[bytes, str]],
+    doc_items: list[tuple[str, Optional[tuple[bytes, str]]]],
 ) -> list[str]:
     uploaded_lines: list[str] = []
-    files_to_send: list[tuple[str, bytes, str]] = []
-    if sts_front:
-        files_to_send.append(("СТС (лицевая сторона)", sts_front[0], sts_front[1]))
-    if sts_back:
-        files_to_send.append(("СТС (обратная сторона)", sts_back[0], sts_back[1]))
-
-    for label, raw_bytes, fname in files_to_send:
+    for label, doc_tuple in doc_items:
+        if not doc_tuple:
+            continue
+        raw_bytes, fname = doc_tuple
+        mime = _guess_image_mime(fname)
         form = aiohttp.FormData()
-        form.add_field("file", raw_bytes, filename=fname, content_type="image/jpeg")
+        form.add_field("file", raw_bytes, filename=fname, content_type=mime)
         try:
             async with session.post(
                 f"{base_url}/api/v4/files",
                 data=form,
                 headers={"Authorization": f"Bearer {AMOCRM_ACCESS_TOKEN}"},
-                timeout=25,
+                timeout=30,
             ) as resp:
                 txt = await resp.text()
-                if resp.status not in (200, 201):
-                    uploaded_lines.append(f"{label}: {fname} (ошибка загрузки {resp.status})")
+                if resp.status not in (200, 201, 202):
+                    logger.warning("amoCRM /api/v4/files ошибка (%s) для %s: %s", resp.status, label, txt[:250])
+                    uploaded_lines.append(f"{label}: {fname} (ошибка загрузки {resp.status}: {txt[:120]})")
                     continue
+
                 parsed = json.loads(txt) if txt else {}
                 item = None
                 if isinstance(parsed, list) and parsed:
                     item = parsed[0]
                 elif isinstance(parsed, dict):
-                    files_list = parsed.get("_embedded", {}).get("files", [])
+                    files_list = (parsed.get("_embedded") or {}).get("files") or []
                     item = files_list[0] if files_list else parsed
+
                 uuid_val = item.get("uuid") if isinstance(item, dict) else None
-                dl_url = item.get("_links", {}).get("download") if isinstance(item, dict) else None
+                dl_url = (
+                    ((item.get("_links") or {}).get("download") or {}).get("href")
+                    if isinstance(item, dict)
+                    and isinstance((item.get("_links") or {}).get("download"), dict)
+                    else ((item.get("_links") or {}).get("download") if isinstance(item, dict) else None)
+                )
+
+                attached_ok = False
                 if uuid_val:
                     for ent, eid in [("leads", lead_id), ("contacts", contact_id)]:
-                        if eid:
-                            await session.put(
-                                f"{base_url}/api/v4/{ent}/{eid}/files",
-                                headers=_amocrm_headers(),
-                                json=[{"file_uuid": uuid_val}],
-                                timeout=20,
-                            )
-                uploaded_lines.append(f"{label}: {fname}" + (f" ({dl_url})" if dl_url else ""))
+                        if not eid:
+                            continue
+                        async with session.put(
+                            f"{base_url}/api/v4/{ent}/{eid}/files",
+                            headers=_amocrm_headers(),
+                            json=[{"file_uuid": uuid_val}],
+                            timeout=20,
+                        ) as put_resp:
+                            put_txt = await put_resp.text()
+                            if put_resp.status in (200, 201, 202):
+                                attached_ok = True
+                            else:
+                                logger.warning("amoCRM attach file warning (%s): %s", put_resp.status, put_txt[:200])
+
+                status_tag = "прикреплён" if attached_ok else "загружен"
+                link_part = f" — {dl_url}" if isinstance(dl_url, str) and dl_url else ""
+                uploaded_lines.append(f"{label}: {fname} ({status_tag}{link_part})")
         except Exception as exc:
-            logger.warning("Ошибка загрузки %s в amoCRM: %s", label, exc)
-            uploaded_lines.append(f"{label}: {fname} (не удалось загрузить)")
+            logger.exception("Ошибка загрузки %s в amoCRM: %s", label, exc)
+            uploaded_lines.append(f"{label}: {fname} (ошибка: {exc})")
     return uploaded_lines
 
 
@@ -1122,8 +1209,7 @@ async def _find_existing_client_lead(
 
 async def send_lead_to_amocrm(
     lead: dict[str, Any],
-    sts_front: Optional[tuple[bytes, str]] = None,
-    sts_back: Optional[tuple[bytes, str]] = None,
+    doc_items: list[tuple[str, Optional[tuple[bytes, str]]]] | None = None,
 ) -> tuple[bool, str]:
     if not AMOCRM_BASE_URL or not AMOCRM_ACCESS_TOKEN:
         return False, "не заполнены AMOCRM_BASE_URL / AMOCRM_ACCESS_TOKEN"
@@ -1135,6 +1221,7 @@ async def send_lead_to_amocrm(
         tg_login = format_tg_login(chat_id, tg_username)
         tg_link = format_tg_link(chat_id, tg_username)
         phone = normalize_phone(lead.get("phone", ""))
+        address = str(lead.get("address") or "").strip()
         lead_title = f"ЛунапаркЕда ({lead['type']}): {lead['name']} — {lead['city']}"
 
         note_lines = [
@@ -1142,6 +1229,7 @@ async def send_lead_to_amocrm(
             f"Тип заявки: {lead['type']}",
             f"Имя: {lead['name']}",
             f"Город: {lead['city']}",
+            f"Адрес прописки: {address or '—'}",
             f"Формат/транспорт: {lead['transport']}",
             f"Телефон: {phone}",
             f"Telegram: {tg_login}",
@@ -1160,6 +1248,7 @@ async def send_lead_to_amocrm(
                     [
                         (AMOCRM_FIELD_IDS["lead_telegram"], ("telegram", "телеграм", "тг", "tg", "аккаунт", "логин"), tg_login),
                         (AMOCRM_FIELD_IDS["lead_city"], ("город", "city", "регион"), lead.get("city", "")),
+                        (None, ("прописк", "адрес", "address"), address),
                         (AMOCRM_FIELD_IDS["lead_transport"], ("транспорт", "формат", "доставк", "авто", "категор"), lead.get("transport", "")),
                         (AMOCRM_FIELD_IDS["lead_phone"], ("телефон", "phone", "номер"), phone),
                         (None, ("chat_id", "tg id", "telegram id", "id чата"), chat_id),
@@ -1175,6 +1264,7 @@ async def send_lead_to_amocrm(
                     [
                         (AMOCRM_FIELD_IDS["contact_telegram"], ("telegram", "телеграм", "тг", "tg", "аккаунт", "логин"), tg_login),
                         (AMOCRM_FIELD_IDS["contact_city"], ("город", "city", "регион"), lead.get("city", "")),
+                        (None, ("прописк", "адрес", "address"), address),
                         (AMOCRM_FIELD_IDS["contact_transport"], ("транспорт", "формат", "доставк", "авто"), lead.get("transport", "")),
                     ],
                 )
@@ -1194,11 +1284,11 @@ async def send_lead_to_amocrm(
                         if presp.status not in (200, 201, 202):
                             logger.warning("amoCRM patch warning (%s): %s", presp.status, await presp.text())
 
-                    sts_lines = await _upload_and_attach_sts(
-                        session, base_url, existing_lead_id, None, sts_front, sts_back
+                    doc_lines = await _upload_and_attach_docs(
+                        session, base_url, existing_lead_id, None, doc_items or []
                     )
-                    if sts_lines:
-                        note_lines.extend(sts_lines)
+                    if doc_lines:
+                        note_lines.extend(doc_lines)
                     await _add_amocrm_note(session, base_url, existing_lead_id, "\n".join(note_lines))
                     return True, f"обновлена сделка #{existing_lead_id}"
 
@@ -1236,16 +1326,15 @@ async def send_lead_to_amocrm(
 
                 if lead_id:
                     save_client_lead(chat_id, int(lead_id))
-                    sts_lines = await _upload_and_attach_sts(
+                    doc_lines = await _upload_and_attach_docs(
                         session,
                         base_url,
                         int(lead_id),
                         int(contact_id) if contact_id else None,
-                        sts_front,
-                        sts_back,
+                        doc_items or [],
                     )
-                    if sts_lines:
-                        note_lines.extend(sts_lines)
+                    if doc_lines:
+                        note_lines.extend(doc_lines)
                     await _add_amocrm_note(session, base_url, int(lead_id), "\n".join(note_lines))
                     if contact_id:
                         await _add_amocrm_contact_note(session, base_url, int(contact_id), "\n".join(note_lines))
@@ -1325,7 +1414,7 @@ async def send_help_to_amocrm(
                         timeout=15,
                     ) as cpresp:
                         if cpresp.status not in (200, 201, 202):
-                            logger.warning("amoCRM patch contact warning (%s): %s", cpresp.status, await cresp.text())
+                            logger.warning("amoCRM patch contact warning (%s): %s", cpresp.status, await cpresp.text())
                     await _add_amocrm_contact_note(session, base_url, contact_id, note_text)
 
                 lead_cf_values = _build_custom_fields_values(
@@ -1797,7 +1886,7 @@ async def _get_driver_adjustments_list(
     driver_id: str,
     force_refresh: bool = False,
 ) -> list[str]:
-    cache_key = f"adj_v3:{park['park_id']}:{driver_id}"
+    cache_key = f"adj_v4:{park['park_id']}:{driver_id}"
     now_mono = time.monotonic()
     cached = DRIVER_FINES_CACHE.get(cache_key)
     if not force_refresh and cached and (now_mono - cached["ts"]) < DRIVER_FINES_TTL_SEC:
@@ -1875,9 +1964,9 @@ async def _get_driver_adjustments_list(
             continue
 
         if any(aw in low_all for aw in adjustment_words) and amount != 0:
-            rub_val = f"{abs(amount):.2f} ₽"
+            rub_val = f"{abs(amount):.2f}"
             violation = desc or cat_name or "корректировка"
-            lines.append(f"Списано {rub_val}, {violation}, {dt_str}.")
+            lines.append(f"Корректировка за {violation}, дата: {dt_str}, сумма: {rub_val} ₽.")
 
     DRIVER_FINES_CACHE[cache_key] = {"ts": now_mono, "lines": lines[:20]}
     return lines[:20]
@@ -1956,7 +2045,6 @@ def build_admin_summary_text(period_days: int) -> str:
 
 
 async def build_orders_per_hour_spb_msk_text() -> str:
-    """Выгружает по СПб и МСК заказы/активность (минимум по 5 позиций на город)."""
     now = datetime.now(timezone.utc)
     hour_ago = now - timedelta(hours=1)
     day_ago = now - timedelta(days=1)
@@ -2120,7 +2208,6 @@ async def notify_superadmin_about_demand(city_name: str, rate_rub_hour: int = DE
 
 
 async def demand_monitor_worker() -> None:
-    """Периодически проверяет активность заказов и предлагает суперадмину рассылку при спросе."""
     await asyncio.sleep(25)
     while True:
         try:
@@ -2188,19 +2275,23 @@ async def send_start_menu(chat_id: int | str, first_name: str = "друг") -> N
 
 async def show_confirmation_screen(chat_id: int | str, data: dict[str, Any]) -> None:
     set_user_state(chat_id, "reg_confirm", data)
-    sts_line = ""
-    if requires_two_sided_sts(data.get("transport", "")):
-        has_front = bool(data.get("sts_front_file_id"))
-        has_back = bool(data.get("sts_back_file_id"))
-        sts_line = f"\nФото СТС: {'загружены с двух сторон' if (has_front and has_back) else 'не загружены'}\n"
+    docs_block = ""
+    if requires_vehicle_docs(data.get("transport", "")):
+        sts_ok = bool(data.get("sts_front_file_id") and data.get("sts_back_file_id"))
+        vu_ok = bool(data.get("vu_front_file_id") and data.get("vu_back_file_id"))
+        docs_block = (
+            f"\nФото СТС: {'загружены с двух сторон' if sts_ok else 'не загружены'}"
+            f"\nФото ВУ: {'загружены с двух сторон' if vu_ok else 'не загружены'}\n"
+        )
 
     text = (
         "Проверь, пожалуйста, всё ли корректно:\n\n"
         f"Имя: {data.get('name', '—')}\n"
         f"Город: {data.get('city', '—')}\n"
         f"Формат: {data.get('transport', '—')}\n"
-        f"Телефон: {data.get('phone', '—')}"
-        f"{sts_line}\n"
+        f"Телефон: {data.get('phone', '—')}\n"
+        f"Адрес прописки: {data.get('address', '—')}"
+        f"{docs_block}\n"
         "Всё верно? Нажми «Да» или «Исправить»."
     )
     await tg_send_text(chat_id, text, reply_markup=kb_confirm_application())
@@ -2209,10 +2300,10 @@ async def show_confirmation_screen(chat_id: int | str, data: dict[str, Any]) -> 
 async def show_courier_welcome(chat_id: int | str, driver: dict[str, Any]) -> None:
     first_name = _short_first_name(driver["full_name"])
     text = (
-        f"Добро пожаловать, {first_name}! 🎉\n\n"
-        "Рады видеть тебя в парке! Здесь ты можешь легко смотреть статистику поездок 📊, "
-        "следить за целями и бонусами 🎯, проверять корректировки ⚖️ и писать в поддержку, "
-        "если понадобится помощь 💬."
+        f"Привет, {first_name}! Рады видеть тебя в ЛунапаркЕда.\n\n"
+        "Здесь ты всегда можешь глянуть свежую статистику по заказам и пробегу, "
+        "проверить прогресс по бонусу, посмотреть корректировки без лишних сложностей "
+        "или написать нам, если понадобится помощь. Хороших смен и ровных маршрутов."
     )
     await tg_send_text(chat_id, text, reply_markup=kb_courier_cabinet())
 
@@ -2237,7 +2328,7 @@ async def show_courier_statistics(chat_id: int | str, driver: dict[str, Any]) ->
         f"💳 Баланс: {driver['balance']:.2f} ₽\n"
         f"📦 Заказов выполнено: {stats['completed_7d']}\n"
         f"🛣 Прошёл / проехал: {stats['distance_km_7d']:.1f}{km_suffix}\n\n"
-        "Отличный темп! Если захочешь посмотреть прогресс по бонусу — жми «🎁 Цель»."
+        "Отличный темп! Если захочешь посмотреть прогресс по бонусу — жми «🎁 Бонус»."
     )
     await tg_send_text(chat_id, text, reply_markup=kb_courier_cabinet())
 
@@ -2267,7 +2358,17 @@ async def get_saved_profile_or_redirect(chat_id: int | str) -> dict[str, Any] | 
     return profiles[0]
 
 
-async def lookup_and_route_phone(chat_id: int | str, phone: str) -> None:
+async def lookup_and_route_phone(chat_id: int | str, phone: str, used_contact_button: bool = False) -> None:
+    allowed, wait_sec = check_auth_rate_limit(chat_id)
+    if not allowed:
+        await send_ephemeral_text(
+            chat_id,
+            f"Слишком много попыток проверки номера. Подожди {wait_sec} сек и попробуй снова.",
+            reply_markup=kb_start_menu(is_admin=is_admin_user(chat_id, chat_id)),
+            ttl_sec=15,
+        )
+        return
+
     await send_ephemeral_text(
         chat_id,
         "Секунду, проверяю номер в базе парка...",
@@ -2286,6 +2387,7 @@ async def lookup_and_route_phone(chat_id: int | str, phone: str) -> None:
         return
 
     if not profiles:
+        record_auth_attempt(chat_id, success=False)
         await tg_send_text(
             chat_id,
             "Этот номер не зарегистрирован в парке.\n\n"
@@ -2293,6 +2395,8 @@ async def lookup_and_route_phone(chat_id: int | str, phone: str) -> None:
             reply_markup=kb_not_found_connect(),
         )
         return
+
+    record_auth_attempt(chat_id, success=True)
 
     if len(profiles) == 1:
         chosen = profiles[0]
@@ -2307,7 +2411,7 @@ async def lookup_and_route_phone(chat_id: int | str, phone: str) -> None:
         return
 
     PENDING_PROFILES[str(chat_id)] = profiles
-    set_user_state(chat_id, "courier_pick_profile", {})
+    set_user_state(chat_id, "courier_pick_profile", {"verified_by_contact": used_contact_button})
     lines = ["Нашёл несколько профилей — выбери нужный:\n"]
     for idx, prof in enumerate(profiles[:10]):
         status_ru = "Работает" if prof["work_status"] == "working" else prof["work_status"]
@@ -2330,10 +2434,13 @@ async def finalize_registration(
 ) -> None:
     clear_user_state(chat_id)
     norm_phone = data.get("phone", "")
+    city_val = data.get("city", "")
+    address_val = data.get("address", "")
     save_user_session(
         chat_id,
         phone=norm_phone,
-        city=data.get("city", ""),
+        city=city_val,
+        address=address_val,
         username=tg_username,
         full_name=data.get("name") or contact_name,
     )
@@ -2342,7 +2449,8 @@ async def finalize_registration(
     lead_payload = {
         "type": "Подключение",
         "name": data.get("name") or contact_name,
-        "city": data.get("city", "—"),
+        "city": city_val or "—",
+        "address": address_val or "—",
         "transport": data.get("transport", "—"),
         "phone": norm_phone,
         "tg_username": tg_login,
@@ -2350,15 +2458,20 @@ async def finalize_registration(
     }
     save_application(lead_payload)
 
-    sts_front = None
-    sts_back = None
-    if data.get("sts_front_file_id"):
-        sts_front = await tg_download_file(data["sts_front_file_id"], f"sts_front_{chat_id}.jpg")
-    if data.get("sts_back_file_id"):
-        sts_back = await tg_download_file(data["sts_back_file_id"], f"sts_back_{chat_id}.jpg")
+    doc_specs = [
+        ("sts_front_file_id", "СТС (лицевая сторона)", f"sts_front_{chat_id}.jpg"),
+        ("sts_back_file_id", "СТС (обратная сторона)", f"sts_back_{chat_id}.jpg"),
+        ("vu_front_file_id", "ВУ (лицевая сторона)", f"vu_front_{chat_id}.jpg"),
+        ("vu_back_file_id", "ВУ (обратная сторона)", f"vu_back_{chat_id}.jpg"),
+    ]
+    doc_items: list[tuple[str, Optional[tuple[bytes, str]]]] = []
+    for fid_key, label, fname in doc_specs:
+        if data.get(fid_key):
+            dl = await tg_download_file(data[fid_key], fname)
+            doc_items.append((label, dl))
 
     try:
-        await send_lead_to_amocrm(lead_payload, sts_front=sts_front, sts_back=sts_back)
+        await send_lead_to_amocrm(lead_payload, doc_items=doc_items)
     except Exception as exc:
         logger.warning("Ошибка отправки заявки в amoCRM: %s", exc)
 
@@ -2582,6 +2695,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
                 "type": "Вопрос при отмене подключения",
                 "name": reg_data.get("name") or contact_name,
                 "city": reg_data.get("city") or "—",
+                "address": reg_data.get("address") or "—",
                 "transport": reg_data.get("transport") or "—",
                 "phone": reg_data.get("phone") or get_user_record(chat_id).get("phone") or "—",
                 "tg_username": format_tg_login(chat_id, tg_username),
@@ -2772,7 +2886,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "reg_transport", {"return_to_confirm": False})
         await tg_send_text(
             chat_id,
-            "Шаг 1 из 4. Как планируешь доставлять заказы? 🚀",
+            "Шаг 1. Как планируешь доставлять заказы? 🚀",
             reply_markup=kb_transport_choice(),
         )
         return
@@ -2781,7 +2895,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "courier_auth_phone", {})
         await send_ephemeral_text(
             chat_id,
-            "Нажми «📱 Отправить номер профиля» или введи его вручную 👇",
+            "Нажми «📱 Отправить номер профиля» или введи номер, привязанный к аккаунту (формат не важен, можно без +):",
             reply_markup=kb_courier_phone_auth(),
             ttl_sec=30,
         )
@@ -2793,7 +2907,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             await show_courier_statistics(chat_id, driver)
         return
 
-    if norm_cmd in ("цель", "бонус", "моя цель"):
+    if norm_cmd in ("бонус", "цель", "мой бонус", "моя цель"):
         driver = await get_saved_profile_or_redirect(chat_id)
         if not driver:
             return
@@ -2803,7 +2917,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             async with aiohttp.ClientSession() as session:
                 stats = await _get_driver_orders_stats(session, park, driver["id"], goal_start_dt=goal_start)
         except Exception as exc:
-            await send_ephemeral_text(chat_id, f"Не вышло посчитать цель: {exc}", reply_markup=kb_courier_cabinet())
+            await send_ephemeral_text(chat_id, f"Не вышло посчитать бонус: {exc}", reply_markup=kb_courier_cabinet())
             return
 
         done = stats["completed_goal"]
@@ -2819,7 +2933,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             status_line = f"Осталось выполнить {left} заказ(ов) за {GOAL_DAYS} дней (отсчёт с {start_str}) до бонуса +{GOAL_BONUS} ₽ 💪"
 
         resp_text = (
-            f"🎁 Твоя цель: {GOAL_ORDERS} заказов за {GOAL_DAYS} дней (+{GOAL_BONUS} ₽)\n\n"
+            f"🎁 Твой бонус: {GOAL_ORDERS} заказов за {GOAL_DAYS} дней (+{GOAL_BONUS} ₽)\n\n"
             f"Прогресс: {done} / {GOAL_ORDERS}\n"
             f"{bar}\n\n"
             f"{status_line}"
@@ -2850,13 +2964,13 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if len(re.sub(r"\D", "", raw_phone)) < 10:
             await send_ephemeral_text(
                 chat_id,
-                "Введи номер в формате +7 999 123-45-67 или нажми кнопку отправки номера:",
+                "Введи номер (можно без +, формат не важен) или нажми кнопку отправки номера:",
                 reply_markup=kb_courier_phone_auth(),
                 ttl_sec=15,
             )
             return
         clear_user_state(chat_id)
-        await lookup_and_route_phone(chat_id, normalize_phone(raw_phone))
+        await lookup_and_route_phone(chat_id, normalize_phone(raw_phone), used_contact_button=bool(contact_phone))
         return
 
     if step == "courier_pick_profile":
@@ -2903,11 +3017,11 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             return
         data = update_user_state_data(chat_id, transport=chosen_transport)
         if data.get("return_to_confirm"):
-            if requires_two_sided_sts(chosen_transport) and not (data.get("sts_front_file_id") and data.get("sts_back_file_id")):
+            if requires_vehicle_docs(chosen_transport) and not _has_all_vehicle_docs(data):
                 set_user_state(chat_id, "reg_sts_front", data)
                 await tg_send_text(
                     chat_id,
-                    "Для выбранного формата нужно фото СТС с двух сторон. Пришли лицевую сторону (1 из 2):",
+                    "Для выбранного формата нужны фото СТС и ВУ с двух сторон. Пришли лицевую сторону СТС (1 из 2):",
                     reply_markup=kb_step_with_help(),
                 )
                 return
@@ -2916,7 +3030,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "reg_city", data)
         await tg_send_text(
             chat_id,
-            "Шаг 2 из 4. В каком городе планируешь работать? 🏙",
+            "Шаг 2. В каком городе планируешь работать? 🏙",
             reply_markup=kb_step_with_help(),
         )
         return
@@ -2933,7 +3047,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "reg_name", data)
         await tg_send_text(
             chat_id,
-            "Шаг 3 из 4. Как тебя зовут? Напиши Фамилию и Имя:",
+            "Шаг 3. Как тебя зовут? Напиши Фамилию и Имя:",
             reply_markup=kb_step_with_help(),
         )
         return
@@ -2949,7 +3063,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "reg_phone", data)
         await tg_send_text(
             chat_id,
-            "Шаг 4 из 4. Введи номер телефона (например, +7 999 123-45-67) 📱:",
+            "Шаг 4. Введите Ваш номер телефона, привязанный в Мой налог (формат не важен, можно без +) 📱:",
             reply_markup=kb_step_with_help(),
         )
         return
@@ -2959,7 +3073,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if len(re.sub(r"\D", "", raw_phone)) < 10:
             await send_ephemeral_text(
                 chat_id,
-                "Номер введён не полностью. Введи номер в формате +7 999 123-45-67:",
+                "Номер введён не полностью. Введите Ваш номер телефона, привязанный в Мой налог (можно без +):",
                 reply_markup=kb_step_with_help(),
                 ttl_sec=15,
             )
@@ -2968,7 +3082,29 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if data.get("return_to_confirm"):
             await show_confirmation_screen(chat_id, data)
             return
-        if requires_two_sided_sts(data.get("transport", "")):
+        set_user_state(chat_id, "reg_address", data)
+        await tg_send_text(
+            chat_id,
+            "Шаг 5. Укажите Ваш адрес прописки:",
+            reply_markup=kb_step_with_help(),
+        )
+        return
+
+    if step == "reg_address":
+        if len(raw_text) < 4:
+            await send_ephemeral_text(
+                chat_id,
+                "Укажите полный адрес прописки:",
+                reply_markup=kb_step_with_help(),
+                ttl_sec=15,
+            )
+            return
+        save_user_session(chat_id, address=raw_text)
+        data = update_user_state_data(chat_id, address=raw_text)
+        if data.get("return_to_confirm"):
+            await show_confirmation_screen(chat_id, data)
+            return
+        if requires_vehicle_docs(data.get("transport", "")):
             set_user_state(chat_id, "reg_sts_front", data)
             await tg_send_text(
                 chat_id,
@@ -2989,6 +3125,15 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             )
             return
         data = update_user_state_data(chat_id, sts_front_file_id=file_id)
+        if data.get("editing_single_doc") == "sts_front":
+            data.pop("editing_single_doc", None)
+            set_user_state(chat_id, "reg_sts_back", data)
+            await tg_send_text(
+                chat_id,
+                "Теперь пришли фото обратной стороны СТС (2 из 2):",
+                reply_markup=kb_step_with_help(),
+            )
+            return
         set_user_state(chat_id, "reg_sts_back", data)
         await tg_send_text(
             chat_id,
@@ -3007,6 +3152,45 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             )
             return
         data = update_user_state_data(chat_id, sts_back_file_id=file_id)
+        if data.get("return_to_confirm") and data.get("vu_front_file_id") and data.get("vu_back_file_id"):
+            await show_confirmation_screen(chat_id, data)
+            return
+        set_user_state(chat_id, "reg_vu_front", data)
+        await tg_send_text(
+            chat_id,
+            "Теперь пришли фото водительского удостоверения — сначала лицевую сторону (1 из 2):",
+            reply_markup=kb_step_with_help(),
+        )
+        return
+
+    if step == "reg_vu_front":
+        if not file_id:
+            await send_ephemeral_text(
+                chat_id,
+                "Пришли фото лицевой стороны водительского удостоверения (1 из 2):",
+                reply_markup=kb_step_with_help(),
+                ttl_sec=15,
+            )
+            return
+        data = update_user_state_data(chat_id, vu_front_file_id=file_id)
+        set_user_state(chat_id, "reg_vu_back", data)
+        await tg_send_text(
+            chat_id,
+            "Отлично! Теперь пришли фото обратной стороны водительского удостоверения (2 из 2):",
+            reply_markup=kb_step_with_help(),
+        )
+        return
+
+    if step == "reg_vu_back":
+        if not file_id:
+            await send_ephemeral_text(
+                chat_id,
+                "Пришли фото обратной стороны водительского удостоверения (2 из 2):",
+                reply_markup=kb_step_with_help(),
+                ttl_sec=15,
+            )
+            return
+        data = update_user_state_data(chat_id, vu_back_file_id=file_id)
         await show_confirmation_screen(chat_id, data)
         return
 
@@ -3049,13 +3233,25 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             return
         if norm_cmd in ("изменить телефон", "телефон"):
             set_user_state(chat_id, "reg_phone", data)
-            await tg_send_text(chat_id, "Отправь новый номер телефона:", reply_markup=kb_step_with_help())
+            await tg_send_text(chat_id, "Введите Ваш номер телефона, привязанный в Мой налог (можно без +):", reply_markup=kb_step_with_help())
+            return
+        if norm_cmd in ("изменить прописку", "прописка", "адрес"):
+            set_user_state(chat_id, "reg_address", data)
+            await tg_send_text(chat_id, "Укажите новый адрес прописки:", reply_markup=kb_step_with_help())
             return
         if norm_cmd in ("изменить фото стс", "фото стс", "стс"):
             set_user_state(chat_id, "reg_sts_front", data)
             await tg_send_text(
                 chat_id,
                 "Пришли новое фото лицевой стороны СТС (1 из 2):",
+                reply_markup=kb_step_with_help(),
+            )
+            return
+        if norm_cmd in ("изменить фото ву", "фото ву", "ву", "водительское"):
+            set_user_state(chat_id, "reg_vu_front", data)
+            await tg_send_text(
+                chat_id,
+                "Пришли новое фото лицевой стороны водительского удостоверения (1 из 2):",
                 reply_markup=kb_step_with_help(),
             )
             return
