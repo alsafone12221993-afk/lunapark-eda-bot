@@ -39,9 +39,9 @@ AMOCRM_ACCESS_TOKEN = os.getenv(
     "AMOCRM_ACCESS_TOKEN",
     "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImp0aSI6ImQ3NDM4MThmM2IxMzMxYTE2ZDUwZDRhMDA5ZWI3ZmQ1OTI3YTQ5YTljMDE4OWMwZGY5NjY2YTM2OTU4YjdiYjA1ZjhkNmM2MjkyZDY3MjM2In0.eyJhdWQiOiI3NjNkNmJjNC1mMGVmLTQwY2EtYjg3Mi01MmMzMmY5MWM5MTQiLCJqdGkiOiJkNzQzODE4ZjNiMTMzMWExNmQ1MGQ0YTAwOWViN2ZkNTkyN2E0OWE5YzAxODljMGRmOTY2NmEzNjk1OGI3YmIwNWY4ZDZjNjI5MmQ2NzIzNiIsImlhdCI6MTc5NTMzMDQyNiwibmJmIjoxNzk1MzMwNDI2LCJleHAiOjE5NDc2Mjg4MDAsInN1YiI6IjEyNjQ1NDY2IiwiZ3JhbnRfdHlwZSI6IiIsImFjY291bnRfaWQiOjMxMjkwOTc0LCJiYXNlX2RvbWFpbiI6ImFtb2NybS5ydSIsInZlcnNpb24iOjIsInNjb3BlcyI6WyJwdXNoX25vdGlmaWNhdGlvbnMiLCJmaWxlcyIsImNybSIsImZpbGVzX2RlbGV0ZSIsIm5vdGlmaWNhdGlvbnMiXSwiaGFzaF91dWlkIjoiMDFjMWE3MWEtZWI5Yy00MjJjLTg4ODEtMGQ2Mjg3ZDA2ODA2IiwiYXBpX2RvbWFpbiI6ImFwaS1iLmFtb2NybS5ydSJ9.TyjWbPrNmzDY_yUNQwEFO-8kWSW0MNHyoF_Xd5Vir0TRTfhpLGcpUOAKKPRvLvpESIO1wJ-lUXMcmawGdiLFbKLTqQv3djdWUc2vypbZZVsHKXT2_ZHhaLyxYHNtWB-HJ1Z_F8TB404KqnjlQ2n6opAlu5HMdHpamquMn3AJUcZAqMTknQ8_mlaiMQRUvhD1Dvn6XRtJ9SETH3a78QUQbpj__qc-HOT_b91eLHgjUIV6uLVqRyMFioPjrpY0jpZnAk4CLRoClNZPqml5qbcSnFfJuLBD763O5JoprazMnIWIR_r80Nc7DpLLZk3Eb_yXKTiRqj67lskDtvoM6q19zQ",
 )
-AMOCRM_PIPELINE_ID = int(os.getenv("AMOCRM_PIPELINE_ID", "10053610"))  # Яндекс еда
-AMOCRM_STATUS_ID = int(os.getenv("AMOCRM_STATUS_ID", "79731826"))        # Новый лид
-AMOCRM_CLOSED_LOST_ID = int(os.getenv("AMOCRM_CLOSED_LOST_ID", "143"))   # Закрыто и не реализовано
+AMOCRM_PIPELINE_ID = int(os.getenv("AMOCRM_PIPELINE_ID", "10053610"))
+AMOCRM_STATUS_ID = int(os.getenv("AMOCRM_STATUS_ID", "79731826"))
+AMOCRM_CLOSED_LOST_ID = int(os.getenv("AMOCRM_CLOSED_LOST_ID", "143"))
 AMOCRM_TELEGRAM_FIELD_ID: int | None = None
 
 USERS_FILE = "users_db.json"
@@ -56,7 +56,7 @@ FLEET_API_URL = "https://fleet-api.taxi.yandex.net"
 GOAL_ORDERS = 5
 GOAL_DAYS = 14
 GOAL_BONUS = 500
-PROFILE_READY_DELAY_SEC = 600  # 10 минут
+PROFILE_READY_DELAY_SEC = 600
 
 DRIVERS_CACHE: dict[str, dict[str, Any]] = {}
 DRIVERS_TTL_SEC = 3600
@@ -79,8 +79,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("lunapark_wazzup_bot")
 
-
-# ================= ТЕКСТЫ ПОСЛЕ ПОДКЛЮЧЕНИЯ =================
 MSG_AFTER_SUBMIT = (
     "Заявка принята! Профиль создадим в течение 10 минут.\n\n"
     "Пока можно сразу скачать Яндекс Про:\n"
@@ -106,42 +104,71 @@ MSG_PROFILE_CREATED_10M = (
 )
 
 
-# ================= КЛАВИАТУРЫ И ВАРИАНТЫ ОТВЕТА =================
-def kb_start_menu() -> list[list[str]]:
-    return [
-        ["🚀 Подключиться к парку", "✅ Уже курьер парка"],
-        ["❓ Нужна помощь"],
-    ]
+def _build_keyboard_payload(
+    rows: list[list[str]],
+    reply_markup: str = "reply",
+    one_time_keyboard: bool = False,
+) -> dict[str, Any]:
+    buttons_list: list[dict[str, str]] = []
+    for r_idx, row in enumerate(rows):
+        for c_idx, label in enumerate(row):
+            clean_label = str(label).strip()[:64]
+            payload_val = f"btn_{r_idx}_{c_idx}"
+            buttons_list.append({
+                "text": clean_label,
+                "payload": payload_val,
+            })
+    return {
+        "reply_markup": reply_markup,
+        "one_time_keyboard": one_time_keyboard,
+        "buttons": buttons_list[:12],
+    }
 
 
-def kb_courier_cabinet() -> list[list[str]]:
-    return [
-        ["📊 Моя статистика", "🤔 Я на линии?"],
-        ["🎁 Цель", "❓ Нужна помощь"],
-        ["🔄 Сменить номер", "⬅️ В начало"],
-    ]
+def kb_start_menu() -> dict[str, Any]:
+    return _build_keyboard_payload(
+        [
+            ["🚀 Подключиться к парку", "✅ Уже курьер парка"],
+            ["❓ Нужна помощь"],
+        ],
+        reply_markup="reply",
+    )
 
 
-def kb_cancel_only() -> list[list[str]]:
-    return [["❌ Отмена"]]
+def kb_courier_cabinet() -> dict[str, Any]:
+    return _build_keyboard_payload(
+        [
+            ["📊 Моя статистика", "🤔 Я на линии?"],
+            ["🎁 Цель", "❓ Нужна помощь"],
+            ["🔄 Сменить номер", "⬅️ В начало"],
+        ],
+        reply_markup="reply",
+    )
 
 
-def kb_transport_choice() -> list[list[str]]:
-    return [
-        ["🚶 Пеший / Вело", "🛵 Мото"],
-        ["🚗 Авто", "🚚 Грузовой"],
-        ["❌ Отмена"],
-    ]
+def kb_cancel_only() -> dict[str, Any]:
+    return _build_keyboard_payload([["❌ Отмена"]], reply_markup="reply")
 
 
-def kb_confirm_application() -> list[list[str]]:
-    return [
-        ["Да", "Исправить"],
-        ["❌ Отмена"],
-    ]
+def kb_transport_choice() -> dict[str, Any]:
+    return _build_keyboard_payload(
+        [
+            ["🚶 Пеший / Вело", "🛵 Мото"],
+            ["🚗 Авто", "🚚 Грузовой"],
+            ["❌ Отмена"],
+        ],
+        reply_markup="reply",
+    )
 
 
-def kb_edit_field_choice(data: dict[str, Any]) -> list[list[str]]:
+def kb_confirm_application() -> dict[str, Any]:
+    return _build_keyboard_payload(
+        [["Да", "Исправить"], ["❌ Отмена"]],
+        reply_markup="reply",
+    )
+
+
+def kb_edit_field_choice(data: dict[str, Any]) -> dict[str, Any]:
     rows: list[list[str]] = [
         ["Изменить формат", "Изменить город"],
         ["Изменить имя", "Изменить телефон"],
@@ -149,15 +176,15 @@ def kb_edit_field_choice(data: dict[str, Any]) -> list[list[str]]:
     if requires_two_sided_sts(data.get("transport", "")):
         rows.append(["Изменить фото СТС"])
     rows.append(["Назад к проверке", "❌ Отмена"])
-    return rows
+    return _build_keyboard_payload(rows, reply_markup="reply")
 
 
-def kb_profiles_choice(profiles: list[dict[str, Any]]) -> list[list[str]]:
+def kb_profiles_choice(profiles: list[dict[str, Any]]) -> dict[str, Any]:
     rows: list[list[str]] = []
     for idx, prof in enumerate(profiles[:10]):
         rows.append([f"{idx + 1}. {prof['park_name']}"])
     rows.append(["Хочу ввести другой номер", "❌ Отмена"])
-    return rows
+    return _build_keyboard_payload(rows, reply_markup="reply")
 
 
 def normalize_choice_text(raw: str) -> str:
@@ -203,7 +230,6 @@ def parse_transport_choice(raw: str) -> str | None:
     return None
 
 
-# ================= БЕЗОПАСНАЯ РАБОТА С JSON И СОСТОЯНИЯМИ =================
 def _read_json(path: str, default: Any) -> Any:
     if not os.path.exists(path):
         return default
@@ -371,7 +397,6 @@ def save_client_lead(chat_id: str, lead_id: int) -> None:
     _write_json(CLIENT_LEADS_FILE, data)
 
 
-# ================= ОТЛОЖЕННОЕ СООБЩЕНИЕ ЧЕРЕЗ 10 МИНУТ =================
 def schedule_delayed_profile_msg(
     chat_id: str,
     channel_id: str,
@@ -380,12 +405,11 @@ def schedule_delayed_profile_msg(
     tasks = _read_json(DELAYED_TASKS_FILE, [])
     if not isinstance(tasks, list):
         tasks = []
-    send_at = time.time() + delay_sec
     tasks.append({
         "id": str(uuid.uuid4()),
         "chat_id": str(chat_id),
         "channel_id": str(channel_id),
-        "send_at": send_at,
+        "send_at": time.time() + delay_sec,
         "text": MSG_PROFILE_CREATED_10M,
     })
     _write_json(DELAYED_TASKS_FILE, tasks)
@@ -412,7 +436,7 @@ async def delayed_notifications_worker(app: web.Application) -> None:
                             ok = await wazzup_send_text(
                                 chat_id=cid,
                                 text=txt,
-                                buttons=kb_start_menu(),
+                                keyboard=kb_start_menu(),
                                 channel_id=ch_id,
                                 clear_unanswered=False,
                             )
@@ -433,7 +457,6 @@ async def delayed_notifications_worker(app: web.Application) -> None:
         await asyncio.sleep(5)
 
 
-# ================= WAZZUP API (ОТПРАВКА И ВЕБХУКИ) =================
 def _wazzup_headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {WAZZUP_API_KEY.strip()}",
@@ -446,7 +469,7 @@ async def _post_wazzup_message(
     ch: str,
     chat_id: str,
     text: str,
-    buttons: list[list[str]] | None,
+    keyboard: dict[str, Any] | None,
     clear_unanswered: bool,
 ) -> tuple[bool, int, str]:
     payload: dict[str, Any] = {
@@ -457,8 +480,8 @@ async def _post_wazzup_message(
         "crmMessageId": str(uuid.uuid4()),
         "clearUnanswered": clear_unanswered,
     }
-    if buttons:
-        payload["buttons"] = buttons
+    if keyboard:
+        payload["keyboard"] = keyboard
 
     async with session.post(
         f"{WAZZUP_API_BASE}/message",
@@ -473,7 +496,7 @@ async def _post_wazzup_message(
 async def wazzup_send_text(
     chat_id: str,
     text: str,
-    buttons: list[list[str]] | None = None,
+    keyboard: dict[str, Any] | None = None,
     channel_id: str | None = None,
     clear_unanswered: bool = False,
 ) -> bool:
@@ -489,40 +512,27 @@ async def wazzup_send_text(
                 ch=ch,
                 chat_id=str(chat_id),
                 text=text,
-                buttons=buttons,
+                keyboard=keyboard,
                 clear_unanswered=clear_unanswered,
             )
             if ok:
                 logger.info("Wazzup POST /v3/message (%s) -> chatId=%s", status, chat_id)
                 return True
 
-            logger.warning(
-                "Wazzup POST /v3/message с кнопками вернул (%s): %s",
-                status,
-                resp_text[:300],
-            )
-            # Если передавались кнопки и Wazzup отклонил запрос из-за них — повторяем отправку без buttons
-            if buttons:
-                ok_no_btn, status_no_btn, resp_no_btn = await _post_wazzup_message(
+            logger.warning("Wazzup POST /v3/message с keyboard вернул (%s): %s", status, resp_text[:300])
+            if keyboard:
+                ok_no_kb, status_no_kb, resp_no_kb = await _post_wazzup_message(
                     session=session,
                     ch=ch,
                     chat_id=str(chat_id),
                     text=text,
-                    buttons=None,
+                    keyboard=None,
                     clear_unanswered=clear_unanswered,
                 )
-                if ok_no_btn:
-                    logger.info(
-                        "Wazzup POST /v3/message без кнопок прошёл (%s) -> chatId=%s",
-                        status_no_btn,
-                        chat_id,
-                    )
+                if ok_no_kb:
+                    logger.info("Wazzup POST /v3/message без keyboard прошёл (%s) -> chatId=%s", status_no_kb, chat_id)
                     return True
-                logger.error(
-                    "Ошибка Wazzup POST /v3/message без кнопок (%s): %s",
-                    status_no_btn,
-                    resp_no_btn[:300],
-                )
+                logger.error("Ошибка Wazzup POST /v3/message без keyboard (%s): %s", status_no_kb, resp_no_kb[:300])
                 return False
 
             logger.error("Ошибка Wazzup POST /v3/message (%s): %s", status, resp_text[:300])
@@ -533,13 +543,8 @@ async def wazzup_send_text(
 
 
 async def register_wazzup_webhooks() -> None:
-    if not PUBLIC_WEBHOOK_URL.strip():
-        logger.info("PUBLIC_WEBHOOK_URL не задан — авто-регистрация вебхука в Wazzup пропущена")
+    if not PUBLIC_WEBHOOK_URL.strip() or not WAZZUP_API_KEY.strip():
         return
-    if not WAZZUP_API_KEY.strip():
-        logger.warning("WAZZUP_API_KEY не задан — авто-регистрация вебхука пропущена")
-        return
-
     payload = {
         "webhooksUri": PUBLIC_WEBHOOK_URL.strip(),
         "subscriptions": {
@@ -568,7 +573,6 @@ async def download_file_from_url(url: str, default_name: str) -> Optional[tuple[
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=25) as resp:
                 if resp.status != 200:
-                    logger.warning("Не удалось скачать файл по contentUri (%s): HTTP %s", url, resp.status)
                     return None
                 raw = await resp.read()
                 if not raw:
@@ -584,7 +588,6 @@ async def download_file_from_url(url: str, default_name: str) -> Optional[tuple[
         return None
 
 
-# ================= ИНТЕГРАЦИЯ С AMOCRM =================
 def _amocrm_headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {AMOCRM_ACCESS_TOKEN.strip()}",
@@ -601,7 +604,6 @@ async def _detect_tg_custom_field_id(
         return AMOCRM_TELEGRAM_FIELD_ID
     if entity_type in _DETECTED_TG_FIELD_CACHE:
         return _DETECTED_TG_FIELD_CACHE[entity_type]
-
     try:
         async with session.get(
             f"{base_url}/api/v4/{entity_type}/custom_fields",
@@ -628,7 +630,6 @@ async def _detect_tg_custom_field_id(
                     return fid
     except Exception as exc:
         logger.warning("Не удалось определить поле Telegram для %s: %s", entity_type, exc)
-
     _DETECTED_TG_FIELD_CACHE[entity_type] = None
     return None
 
@@ -697,7 +698,6 @@ async def _upload_and_attach_sts(
         except Exception as exc:
             logger.warning("Ошибка загрузки %s в amoCRM: %s", label, exc)
             uploaded_lines.append(f"{label}: {fname} (не удалось загрузить)")
-
     return uploaded_lines
 
 
@@ -812,16 +812,10 @@ async def send_lead_to_amocrm(
                     return True, f"обновлена сделка #{existing_lead_id}"
 
                 contact_fields: list[dict[str, Any]] = [
-                    {
-                        "field_code": "PHONE",
-                        "values": [{"value": phone, "enum_code": "MOB"}],
-                    }
+                    {"field_code": "PHONE", "values": [{"value": phone, "enum_code": "MOB"}]}
                 ]
                 if contact_tg_fid:
-                    contact_fields.append({
-                        "field_id": contact_tg_fid,
-                        "values": [{"value": tg_login}],
-                    })
+                    contact_fields.append({"field_id": contact_tg_fid, "values": [{"value": tg_login}]})
 
                 lead_obj: dict[str, Any] = {"name": lead_title}
                 if AMOCRM_PIPELINE_ID:
@@ -838,10 +832,7 @@ async def send_lead_to_amocrm(
                         **lead_obj,
                         "_embedded": {
                             "contacts": [
-                                {
-                                    "first_name": lead["name"],
-                                    "custom_fields_values": contact_fields,
-                                }
+                                {"first_name": lead["name"], "custom_fields_values": contact_fields}
                             ]
                         },
                     }
@@ -931,15 +922,9 @@ async def send_help_to_amocrm(
 
                 contact_fields: list[dict[str, Any]] = []
                 if phone:
-                    contact_fields.append({
-                        "field_code": "PHONE",
-                        "values": [{"value": phone, "enum_code": "MOB"}],
-                    })
+                    contact_fields.append({"field_code": "PHONE", "values": [{"value": phone, "enum_code": "MOB"}]})
                 if contact_tg_fid:
-                    contact_fields.append({
-                        "field_id": contact_tg_fid,
-                        "values": [{"value": tg_login}],
-                    })
+                    contact_fields.append({"field_id": contact_tg_fid, "values": [{"value": tg_login}]})
 
                 lead_obj: dict[str, Any] = {"name": f"ЛунапаркЕда (Помощь): {safe_name} ({tg_login})"}
                 if AMOCRM_PIPELINE_ID:
@@ -955,12 +940,7 @@ async def send_help_to_amocrm(
                 if contact_fields:
                     contact_payload["custom_fields_values"] = contact_fields
 
-                payload = [
-                    {
-                        **lead_obj,
-                        "_embedded": {"contacts": [contact_payload]},
-                    }
-                ]
+                payload = [{**lead_obj, "_embedded": {"contacts": [contact_payload]}}]
 
                 async with session.post(
                     f"{base_url}/api/v4/leads/complex",
@@ -984,7 +964,6 @@ async def send_help_to_amocrm(
             return False, str(exc)
 
 
-# ================= ЯНДЕКС FLEET API =================
 def _safe_float(val: Any) -> float:
     if val is None:
         return 0.0
@@ -995,8 +974,7 @@ def _safe_float(val: Any) -> float:
             if k in val:
                 return _safe_float(val[k])
         return 0.0
-    cleaned = str(val).replace(" ", "").replace(",", ".")
-    cleaned = re.sub(r"[^\d.-]", "", cleaned)
+    cleaned = re.sub(r"[^\d.-]", "", str(val).replace(" ", "").replace(",", "."))
     try:
         return float(cleaned)
     except ValueError:
@@ -1039,7 +1017,6 @@ async def _post_fleet_with_retry(
                 except ValueError:
                     wait_sec = 1.5 * (2 ** attempt)
                 last_err = "HTTP 429"
-                logger.warning("429 на %s (%s), пауза %.1f сек...", path, park["name"], wait_sec)
                 await asyncio.sleep(wait_sec)
                 continue
             if resp.status != 200:
@@ -1070,27 +1047,22 @@ async def _fetch_all_drivers_for_park(
     offset = 0
     limit = 500
     result: list[dict[str, Any]] = []
-
     try:
         while True:
             data = await _fetch_drivers_page(session, park, offset=offset, limit=limit)
             batch = data.get("driver_profiles", []) or []
             if not batch:
                 break
-
             result.extend(batch)
             total = data.get("total")
             offset += len(batch)
             if total is not None and offset >= int(total):
                 break
-
             await asyncio.sleep(PAGE_PAUSE_SEC)
     except RuntimeError as exc:
         if "429" in str(exc) and (result or partial_fallback):
-            logger.warning("Частичный кэш по парку %s из-за 429", park["name"])
             return result if len(result) > len(partial_fallback or []) else (partial_fallback or [])
         raise
-
     return result
 
 
@@ -1180,8 +1152,7 @@ async def _find_all_profiles_by_phone(
     found: list[dict[str, Any]] = []
     for park in PARKS_CONFIG:
         drivers = await get_cached_drivers(session, park, force_refresh=False)
-        park_matches = _extract_matches_in_park(park, drivers, target_phone)
-        found.extend(park_matches)
+        found.extend(_extract_matches_in_park(park, drivers, target_phone))
     return found
 
 
@@ -1285,7 +1256,26 @@ async def _get_driver_orders_stats(
         return result
 
 
-# ================= БИЗНЕС-ЛОГИКА ДИАЛОГА (ЧЕРЕЗ WAZZUP) =================
+async def send_start_menu(chat_id: str, channel_id: str, greeting_name: str | None = None) -> None:
+    clear_user_state(chat_id)
+    if greeting_name:
+        text = (
+            f"Привет, {greeting_name}!\n\n"
+            "Официальный бот парка ЛунапаркЕда. Выберите нужный раздел:\n"
+            "1. Подключиться к парку\n"
+            "2. Уже курьер парка\n"
+            "3. Нужна помощь"
+        )
+    else:
+        text = (
+            "Главное меню парка ЛунапаркЕда:\n"
+            "1. Подключиться к парку\n"
+            "2. Уже курьер парка\n"
+            "3. Нужна помощь"
+        )
+    await wazzup_send_text(chat_id, text, keyboard=kb_start_menu(), channel_id=channel_id)
+
+
 async def show_confirmation_screen(chat_id: str, channel_id: str, data: dict[str, Any]) -> None:
     set_user_state(chat_id, "reg_confirm", data)
     sts_line = ""
@@ -1303,7 +1293,7 @@ async def show_confirmation_screen(chat_id: str, channel_id: str, data: dict[str
         f"{sts_line}\n"
         "Всё верно? Напишите или нажмите «Да» / «Исправить»."
     )
-    await wazzup_send_text(chat_id, text, buttons=kb_confirm_application(), channel_id=channel_id)
+    await wazzup_send_text(chat_id, text, keyboard=kb_confirm_application(), channel_id=channel_id)
 
 
 async def show_cabinet_for_profile(chat_id: str, channel_id: str, driver: dict[str, Any]) -> None:
@@ -1336,9 +1326,9 @@ async def show_cabinet_for_profile(chat_id: str, channel_id: str, driver: dict[s
         f"🏢 Парк: {driver['park_name']}\n\n"
         f"💳 Баланс: {driver['balance']:.2f} ₽\n"
         f"{orders_block}\n"
-        "Кабинет курьера открыт — выбирайте нужный раздел в меню 👇"
+        "Кабинет курьера открыт: выберите раздел или напишите «В начало»."
     )
-    await wazzup_send_text(chat_id, text, buttons=kb_courier_cabinet(), channel_id=channel_id)
+    await wazzup_send_text(chat_id, text, keyboard=kb_courier_cabinet(), channel_id=channel_id)
 
 
 async def get_saved_profile_or_redirect(chat_id: str, channel_id: str) -> dict[str, Any] | None:
@@ -1349,7 +1339,7 @@ async def get_saved_profile_or_redirect(chat_id: str, channel_id: str) -> dict[s
         await wazzup_send_text(
             chat_id,
             "Сначала укажите ваш номер телефона в парке:",
-            buttons=kb_cancel_only(),
+            keyboard=kb_cancel_only(),
             channel_id=channel_id,
         )
         return None
@@ -1376,7 +1366,7 @@ async def lookup_and_route_phone(chat_id: str, channel_id: str, phone: str) -> N
         await wazzup_send_text(
             chat_id,
             f"⚠️ Не удалось проверить профиль в парке: {exc}",
-            buttons=kb_start_menu(),
+            keyboard=kb_start_menu(),
             channel_id=channel_id,
         )
         return
@@ -1385,8 +1375,8 @@ async def lookup_and_route_phone(chat_id: str, channel_id: str, phone: str) -> N
         await wazzup_send_text(
             chat_id,
             f"❌ Номер {phone} не найден в базе подключённых парков.\n\n"
-            "Проверьте правильность номера или нажмите «🚀 Подключиться к парку», чтобы оставить заявку.",
-            buttons=kb_start_menu(),
+            "Проверьте правильность номера или выберите «Подключиться к парку», чтобы оставить заявку.",
+            keyboard=kb_start_menu(),
             channel_id=channel_id,
         )
         return
@@ -1413,7 +1403,7 @@ async def lookup_and_route_phone(chat_id: str, channel_id: str, phone: str) -> N
     await wazzup_send_text(
         chat_id,
         "\n".join(lines),
-        buttons=kb_profiles_choice(profiles),
+        keyboard=kb_profiles_choice(profiles),
         channel_id=channel_id,
     )
 
@@ -1458,16 +1448,13 @@ async def finalize_registration(
     except Exception as exc:
         logger.warning("Ошибка отправки заявки в amoCRM: %s", exc)
 
-    # 1. Сразу отправляем приветствие со ссылками на Яндекс Про
     await wazzup_send_text(
         chat_id,
         MSG_AFTER_SUBMIT,
-        buttons=kb_start_menu(),
+        keyboard=kb_start_menu(),
         channel_id=channel_id,
         clear_unanswered=False,
     )
-
-    # 2. Ставим в очередь сообщение «Профиль создан!» через 10 минут
     schedule_delayed_profile_msg(chat_id, channel_id, delay_sec=PROFILE_READY_DELAY_SEC)
 
 
@@ -1512,8 +1499,6 @@ def _extract_incoming_fields(msg: dict[str, Any]) -> tuple[str, str, str, str, s
 async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
     if not isinstance(msg, dict):
         return
-
-    # Игнорируем исходящие (isEcho=True)
     if msg.get("isEcho") is True:
         return
 
@@ -1540,43 +1525,49 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
 
     norm_cmd = normalize_choice_text(text)
 
-    # Глобальные команды и кнопки навигации
-    if text == "/start" or norm_cmd in ("в начало", "главное меню", "старт", "start"):
-        clear_user_state(chat_id)
-        greeting = (
-            f"Привет, {contact_name}! 👋\n\n"
-            "Добро пожаловать в официальный бот парка ЛунапаркЕда.\n"
-            "Выберите нужный пункт в меню ниже 👇"
-        ) if text == "/start" else "Главное меню 👇"
-        await wazzup_send_text(chat_id, greeting, buttons=kb_start_menu(), channel_id=channel_id)
+    if text == "/start" or norm_cmd in ("в начало", "главное меню", "старт", "start", "меню"):
+        await send_start_menu(chat_id, channel_id, greeting_name=contact_name if text == "/start" else None)
         return
 
     if norm_cmd in ("отмена", "отменить", "cancel"):
-        clear_user_state(chat_id)
-        await wazzup_send_text(chat_id, "Отменено.", buttons=kb_start_menu(), channel_id=channel_id)
+        await send_start_menu(chat_id, channel_id)
         return
 
-    if norm_cmd in ("подключиться к парку", "подключиться", "регистрация", "стать курьером"):
+    state = get_user_state(chat_id)
+    step = state.get("step")
+    data = state.get("data") or {}
+
+    if step is None and norm_cmd in ("1", "подключиться к парку", "подключиться", "регистрация", "стать курьером"):
         set_user_state(chat_id, "reg_transport", {"mode": "courier", "return_to_confirm": False})
         await wazzup_send_text(
             chat_id,
             "Шаг 1 из 4. Как планируете доставлять заказы?\n\n"
-            "Напишите или выберите вариант:\n"
+            "Выберите вариант или напишите цифру:\n"
             "1. Пеший / Вело\n"
             "2. Мото\n"
             "3. Авто\n"
             "4. Грузовой",
-            buttons=kb_transport_choice(),
+            keyboard=kb_transport_choice(),
             channel_id=channel_id,
         )
         return
 
-    if norm_cmd in ("уже курьер парка", "уже курьер", "кабинет", "мой кабинет"):
+    if step is None and norm_cmd in ("2", "уже курьер парка", "уже курьер", "кабинет", "мой кабинет"):
         set_user_state(chat_id, "courier_auth_phone", {})
         await wazzup_send_text(
             chat_id,
             "Введите номер телефона, привязанный к аккаунту в парке:",
-            buttons=kb_cancel_only(),
+            keyboard=kb_cancel_only(),
+            channel_id=channel_id,
+        )
+        return
+
+    if step is None and norm_cmd in ("3", "нужна помощь", "помощь", "поддержка", "оператор"):
+        set_user_state(chat_id, "help_waiting_problem", {})
+        await wazzup_send_text(
+            chat_id,
+            "Добрый день! Опишите Вашу проблему",
+            keyboard=kb_cancel_only(),
             channel_id=channel_id,
         )
         return
@@ -1586,17 +1577,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         await wazzup_send_text(
             chat_id,
             "Отправьте номер телефона для входа в кабинет курьера:",
-            buttons=kb_cancel_only(),
-            channel_id=channel_id,
-        )
-        return
-
-    if norm_cmd in ("нужна помощь", "помощь", "поддержка", "оператор"):
-        set_user_state(chat_id, "help_waiting_problem", {})
-        await wazzup_send_text(
-            chat_id,
-            "Добрый день! Опишите Вашу проблему",
-            buttons=kb_cancel_only(),
+            keyboard=kb_cancel_only(),
             channel_id=channel_id,
         )
         return
@@ -1635,7 +1616,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
             f"📡 Линия: {line_human}\n\n"
             f"📦 Текущие заказы:\n{active_info}"
         )
-        await wazzup_send_text(chat_id, resp_text, buttons=kb_courier_cabinet(), channel_id=channel_id)
+        await wazzup_send_text(chat_id, resp_text, keyboard=kb_courier_cabinet(), channel_id=channel_id)
         return
 
     if norm_cmd in ("цель", "бонус", "моя цель"):
@@ -1669,13 +1650,8 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
             f"{bar}\n\n"
             f"{status_line}"
         )
-        await wazzup_send_text(chat_id, resp_text, buttons=kb_courier_cabinet(), channel_id=channel_id)
+        await wazzup_send_text(chat_id, resp_text, keyboard=kb_courier_cabinet(), channel_id=channel_id)
         return
-
-    # Обработка текущего шага диалога (FSM)
-    state = get_user_state(chat_id)
-    step = state.get("step")
-    data = state.get("data") or {}
 
     if step == "courier_auth_phone":
         raw_phone = contact_phone or text
@@ -1684,7 +1660,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
             await wazzup_send_text(
                 chat_id,
                 "Номер введён не полностью. Введите номер в формате +7 999 123-45-67:",
-                buttons=kb_cancel_only(),
+                keyboard=kb_cancel_only(),
                 channel_id=channel_id,
             )
             return
@@ -1698,7 +1674,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
             await wazzup_send_text(
                 chat_id,
                 "Введите номер телефона, привязанный к аккаунту в парке:",
-                buttons=kb_cancel_only(),
+                keyboard=kb_cancel_only(),
                 channel_id=channel_id,
             )
             return
@@ -1707,8 +1683,8 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         if not m or int(m.group(1)) < 1 or int(m.group(1)) > len(profiles):
             await wazzup_send_text(
                 chat_id,
-                "Выберите профиль кнопкой или напишите его номер из списка:",
-                buttons=kb_profiles_choice(profiles) if profiles else kb_start_menu(),
+                "Выберите профиль из списка или напишите его номер:",
+                keyboard=kb_profiles_choice(profiles) if profiles else kb_start_menu(),
                 channel_id=channel_id,
             )
             return
@@ -1723,7 +1699,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
             await wazzup_send_text(
                 chat_id,
                 "Напишите текстом, что случилось — мы передадим обращение специалисту.",
-                buttons=kb_cancel_only(),
+                keyboard=kb_cancel_only(),
                 channel_id=channel_id,
             )
             return
@@ -1739,11 +1715,10 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         except Exception as exc:
             logger.warning("Ошибка отправки обращения в amoCRM: %s", exc)
 
-        # clear_unanswered=False — оставляем чат неотвеченным в InBox amoCRM для оператора!
         await wazzup_send_text(
             chat_id,
             "Получили ваше сообщение, скоро ответим.",
-            buttons=kb_start_menu(),
+            keyboard=kb_start_menu(),
             channel_id=channel_id,
             clear_unanswered=False,
         )
@@ -1754,12 +1729,12 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         if not chosen_transport:
             await wazzup_send_text(
                 chat_id,
-                "Выберите формат доставки (напишите или нажмите вариант):\n"
+                "Выберите формат доставки (нажмите кнопку или напишите цифру):\n"
                 "1. Пеший / Вело\n"
                 "2. Мото\n"
                 "3. Авто\n"
                 "4. Грузовой",
-                buttons=kb_transport_choice(),
+                keyboard=kb_transport_choice(),
                 channel_id=channel_id,
             )
             return
@@ -1770,7 +1745,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
                 await wazzup_send_text(
                     chat_id,
                     "Для выбранного формата нужно фото СТС с двух сторон. Пришлите лицевую сторону (1 из 2):",
-                    buttons=kb_cancel_only(),
+                    keyboard=kb_cancel_only(),
                     channel_id=channel_id,
                 )
                 return
@@ -1780,14 +1755,14 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         await wazzup_send_text(
             chat_id,
             "Шаг 2 из 4. В каком городе планируете работать?",
-            buttons=kb_cancel_only(),
+            keyboard=kb_cancel_only(),
             channel_id=channel_id,
         )
         return
 
     if step == "reg_city":
         if len(text) < 2:
-            await wazzup_send_text(chat_id, "Напишите корректное название города:", buttons=kb_cancel_only(), channel_id=channel_id)
+            await wazzup_send_text(chat_id, "Напишите корректное название города:", keyboard=kb_cancel_only(), channel_id=channel_id)
             return
         data = update_user_state_data(chat_id, city=text)
         if data.get("return_to_confirm"):
@@ -1797,14 +1772,14 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         await wazzup_send_text(
             chat_id,
             "Шаг 3 из 4. Напишите ваши Фамилию и Имя:",
-            buttons=kb_cancel_only(),
+            keyboard=kb_cancel_only(),
             channel_id=channel_id,
         )
         return
 
     if step == "reg_name":
         if len(text) < 2:
-            await wazzup_send_text(chat_id, "Напишите ваши Фамилию и Имя:", buttons=kb_cancel_only(), channel_id=channel_id)
+            await wazzup_send_text(chat_id, "Напишите ваши Фамилию и Имя:", keyboard=kb_cancel_only(), channel_id=channel_id)
             return
         data = update_user_state_data(chat_id, name=text)
         if data.get("return_to_confirm"):
@@ -1814,7 +1789,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         await wazzup_send_text(
             chat_id,
             "Шаг 4 из 4. Введите ваш номер телефона (например, +7 999 123-45-67):",
-            buttons=kb_cancel_only(),
+            keyboard=kb_cancel_only(),
             channel_id=channel_id,
         )
         return
@@ -1826,7 +1801,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
             await wazzup_send_text(
                 chat_id,
                 "Номер введён не полностью. Введите номер в формате +7 999 123-45-67:",
-                buttons=kb_cancel_only(),
+                keyboard=kb_cancel_only(),
                 channel_id=channel_id,
             )
             return
@@ -1840,7 +1815,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
             await wazzup_send_text(
                 chat_id,
                 "Пришлите фото СТС — сначала лицевую сторону (1 из 2):",
-                buttons=kb_cancel_only(),
+                keyboard=kb_cancel_only(),
                 channel_id=channel_id,
             )
             return
@@ -1852,7 +1827,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
             await wazzup_send_text(
                 chat_id,
                 "Пришлите фото лицевой стороны СТС (1 из 2):",
-                buttons=kb_cancel_only(),
+                keyboard=kb_cancel_only(),
                 channel_id=channel_id,
             )
             return
@@ -1861,7 +1836,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         await wazzup_send_text(
             chat_id,
             "Отлично! Теперь пришлите фото обратной стороны СТС (2 из 2):",
-            buttons=kb_cancel_only(),
+            keyboard=kb_cancel_only(),
             channel_id=channel_id,
         )
         return
@@ -1871,7 +1846,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
             await wazzup_send_text(
                 chat_id,
                 "Пришлите фото обратной стороны СТС (2 из 2):",
-                buttons=kb_cancel_only(),
+                keyboard=kb_cancel_only(),
                 channel_id=channel_id,
             )
             return
@@ -1880,23 +1855,23 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         return
 
     if step == "reg_confirm":
-        if norm_cmd in ("исправить", "изменить", "редактировать"):
+        if norm_cmd in ("2", "исправить", "изменить", "редактировать"):
             data = update_user_state_data(chat_id, return_to_confirm=True)
             set_user_state(chat_id, "reg_choosing_edit", data)
             await wazzup_send_text(
                 chat_id,
-                "Выберите, что хотите изменить:",
-                buttons=kb_edit_field_choice(data),
+                "Что хотите изменить? Выберите вариант или напишите: формат, город, имя, телефон или назад.",
+                keyboard=kb_edit_field_choice(data),
                 channel_id=channel_id,
             )
             return
-        if norm_cmd in ("да", "верно", "подтверждаю", "ок", "yes"):
+        if norm_cmd in ("1", "да", "верно", "подтверждаю", "ок", "yes"):
             await finalize_registration(chat_id, channel_id, data, tg_username)
             return
         await wazzup_send_text(
             chat_id,
-            "Нажмите «Да», если данные верны, или «Исправить», чтобы поменять данные:",
-            buttons=kb_confirm_application(),
+            "Нажмите «Да» или напишите «Да», если данные верны, либо «Исправить», чтобы поменять данные:",
+            keyboard=kb_confirm_application(),
             channel_id=channel_id,
         )
         return
@@ -1909,46 +1884,44 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
             set_user_state(chat_id, "reg_transport", data)
             await wazzup_send_text(
                 chat_id,
-                "Выберите новый формат доставки:\n"
-                "1. Пеший / Вело\n"
-                "2. Мото\n"
-                "3. Авто\n"
-                "4. Грузовой",
-                buttons=kb_transport_choice(),
+                "Выберите новый формат доставки:\n1. Пеший / Вело\n2. Мото\n3. Авто\n4. Грузовой",
+                keyboard=kb_transport_choice(),
                 channel_id=channel_id,
             )
             return
         if norm_cmd in ("изменить город", "город"):
             set_user_state(chat_id, "reg_city", data)
-            await wazzup_send_text(chat_id, "Введите новый город:", buttons=kb_cancel_only(), channel_id=channel_id)
+            await wazzup_send_text(chat_id, "Введите новый город:", keyboard=kb_cancel_only(), channel_id=channel_id)
             return
         if norm_cmd in ("изменить имя", "имя"):
             set_user_state(chat_id, "reg_name", data)
-            await wazzup_send_text(chat_id, "Введите новые Фамилию и Имя:", buttons=kb_cancel_only(), channel_id=channel_id)
+            await wazzup_send_text(chat_id, "Введите новые Фамилию и Имя:", keyboard=kb_cancel_only(), channel_id=channel_id)
             return
         if norm_cmd in ("изменить телефон", "телефон"):
             set_user_state(chat_id, "reg_phone", data)
-            await wazzup_send_text(chat_id, "Отправьте новый номер телефона:", buttons=kb_cancel_only(), channel_id=channel_id)
+            await wazzup_send_text(chat_id, "Отправьте новый номер телефона:", keyboard=kb_cancel_only(), channel_id=channel_id)
             return
         if norm_cmd in ("изменить фото стс", "фото стс", "стс"):
             set_user_state(chat_id, "reg_sts_front", data)
             await wazzup_send_text(
                 chat_id,
                 "Пришлите новое фото лицевой стороны СТС (1 из 2):",
-                buttons=kb_cancel_only(),
+                keyboard=kb_cancel_only(),
                 channel_id=channel_id,
             )
             return
         await wazzup_send_text(
             chat_id,
-            "Выберите пункт из меню ниже:",
-            buttons=kb_edit_field_choice(data),
+            "Выберите поле для изменения или напишите: формат, город, имя, телефон или назад.",
+            keyboard=kb_edit_field_choice(data),
             channel_id=channel_id,
         )
         return
 
+    # Если пользователь написал произвольный текст вне сценария (например, «тест») — показываем меню
+    await send_start_menu(chat_id, channel_id)
 
-# ================= HTTP-СЕРВЕР ДЛЯ ВЕБХУКОВ WAZZUP =================
+
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "service": "lunapark-wazzup-bot"})
 
@@ -1969,7 +1942,6 @@ async def handle_wazzup_webhook(request: web.Request) -> web.Response:
             for msg in messages:
                 if isinstance(msg, dict):
                     asyncio.create_task(handle_incoming_wazzup_message(msg))
-        # Поддержка одиночного сообщения в корне payload на случай разных форматов вебхука
         if isinstance(payload.get("chatId"), (str, int)) and not messages:
             asyncio.create_task(handle_incoming_wazzup_message(payload))
 
