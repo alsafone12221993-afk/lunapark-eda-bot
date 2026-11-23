@@ -201,10 +201,9 @@ def kb_edit_field_choice(data: dict[str, Any]) -> dict[str, Any]:
 
 def kb_courier_cabinet() -> dict[str, Any]:
     return _reply_kb([
-        ["📊 Моя статистика", "🤔 Я на линии?"],
-        ["🎁 Цель", "⚖️ Корректировки"],
-        ["❓ Помощь", "🔄 Сменить номер"],
-        ["⬅️ В начало"],
+        ["📊 Моя статистика", "🎁 Цель"],
+        ["⚖️ Корректировки", "❓ Помощь"],
+        ["🔄 Сменить номер", "⬅️ В начало"],
     ])
 
 
@@ -466,17 +465,21 @@ def get_user_record(chat_id: int | str) -> dict[str, Any]:
     return rec if isinstance(rec, dict) else {}
 
 
-def get_registered_dt(chat_id: int | str) -> datetime:
+def get_goal_start_dt(chat_id: int | str) -> datetime:
+    """Точка отсчёта 14-дневной цели: берём актуальное окно последних 14 дней либо дату регистрации, если она свежее."""
+    now = datetime.now(timezone.utc)
+    default_start = now - timedelta(days=GOAL_DAYS)
     rec = get_user_record(chat_id)
     raw = rec.get("registered_at")
     if raw:
         try:
             dt = datetime.fromisoformat(str(raw))
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            # Если запись создана сегодня/недавно, но до начала работы в парке, берём более раннюю границу в пределах 14 дней
+            return min(dt, default_start)
         except Exception:
             pass
-    entry = save_user_session(chat_id)
-    return datetime.fromisoformat(entry["registered_at"])
+    return default_start
 
 
 def save_application(lead_payload: dict[str, Any]) -> None:
@@ -705,7 +708,7 @@ async def delayed_notifications_worker() -> None:
         await asyncio.sleep(5)
 
 
-# ================= AMOCRM (АВТОЗАПОЛНЕНИЕ ГРАФ СДЕЛКИ И КОНТАКТА) =================
+# ================= AMOCRM =================
 def _amocrm_headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {AMOCRM_ACCESS_TOKEN}",
@@ -1205,7 +1208,7 @@ async def send_help_to_amocrm(
                         timeout=15,
                     ) as cpresp:
                         if cpresp.status not in (200, 201, 202):
-                            logger.warning("amoCRM patch contact warning (%s): %s", cpresp.status, await cpresp.text())
+                            logger.warning("amoCRM patch contact warning (%s): %s", cpresp.status, await cresp.text())
                     await _add_amocrm_contact_note(session, base_url, contact_id, note_text)
 
                 lead_cf_values = _build_custom_fields_values(
@@ -1283,16 +1286,18 @@ async def send_help_to_amocrm(
             return False, str(exc)
 
 
-# ================= YANDEX FLEET API (КАБИНЕТ КУРЬЕРА, КИЛОМЕТРАЖ И КОРРЕКТИРОВКИ) =================
+# ================= YANDEX FLEET API =================
 def _safe_float(val: Any) -> float:
     if val is None:
         return 0.0
     if isinstance(val, (int, float)):
         return float(val)
     if isinstance(val, dict):
-        for k in ("amount", "value", "total", "price"):
-            if k in val:
-                return _safe_float(val[k])
+        for k in ("km", "kilometers", "meters", "amount", "value", "total", "price"):
+            if k in val and val[k] is not None:
+                v = _safe_float(val[k])
+                if v > 0:
+                    return v / 1000.0 if k == "meters" else v
         return 0.0
     cleaned = re.sub(r"[^\d.-]", "", str(val).replace(" ", "").replace(",", "."))
     try:
@@ -1302,27 +1307,67 @@ def _safe_float(val: Any) -> float:
 
 
 def _extract_order_distance_km(order: dict[str, Any]) -> float:
-    for key in ("distance_km", "mileage_km", "route_length_km"):
+    """Достаёт дистанцию заказа в км из всех возможных полей ответа Fleet API."""
+    direct_km_keys = (
+        "distance_km",
+        "mileage_km",
+        "route_length_km",
+        "paid_distance_km",
+        "total_distance_km",
+    )
+    for key in direct_km_keys:
         if key in order and order[key] is not None:
             v = _safe_float(order[key])
             if v > 0:
                 return v
 
-    for key in ("distance", "mileage", "route_length", "paid_distance", "total_distance"):
-        if key in order and order[key] is not None:
-            raw_v = order[key]
-            if isinstance(raw_v, dict):
-                if raw_v.get("km") is not None:
-                    v = _safe_float(raw_v["km"])
-                    if v > 0:
-                        return v
-                if raw_v.get("meters") is not None:
-                    v = _safe_float(raw_v["meters"]) / 1000.0
-                    if v > 0:
-                        return v
+    dist_keys = (
+        "distance",
+        "mileage",
+        "route_length",
+        "paid_distance",
+        "total_distance",
+        "pickup_distance",
+        "delivery_distance",
+    )
+    total_km = 0.0
+    for key in dist_keys:
+        if key not in order or order[key] is None:
+            continue
+        raw_v = order[key]
+        if isinstance(raw_v, dict):
+            if raw_v.get("km") is not None:
+                v = _safe_float(raw_v["km"])
+                if v > 0:
+                    total_km += v
+                    continue
+            if raw_v.get("meters") is not None:
+                v = _safe_float(raw_v["meters"]) / 1000.0
+                if v > 0:
+                    total_km += v
+                    continue
+            for sub_k in ("value", "amount", "distance"):
+                if sub_k in raw_v and raw_v[sub_k] is not None:
+                    sv = _safe_float(raw_v[sub_k])
+                    if sv > 0:
+                        total_km += sv / 1000.0 if sv >= 100 else sv
+                        break
+        else:
             v = _safe_float(raw_v)
             if v > 0:
-                return v / 1000.0 if v >= 100 else v
+                total_km += v / 1000.0 if v >= 100 else v
+
+    if total_km > 0:
+        return total_km
+
+    route_obj = order.get("route")
+    if isinstance(route_obj, dict):
+        for rk in ("distance", "length", "km", "meters"):
+            if rk in route_obj and route_obj[rk] is not None:
+                rv = _safe_float(route_obj[rk])
+                if rv > 0:
+                    return rv / 1000.0 if (rk == "meters" or rv >= 100) else rv
+
     return 0.0
 
 
@@ -1330,7 +1375,7 @@ def _short_first_name(full_name: str) -> str:
     parts = [p for p in (full_name or "").strip().split() if p]
     if len(parts) >= 2:
         return parts[1]
-    return parts[0] if parts else "Курьер"
+    return parts[0] if parts else "друг"
 
 
 def get_park_by_id(park_id: str) -> dict[str, str]:
@@ -1470,7 +1515,6 @@ def _extract_matches_in_park(
         if any(normalize_phone(str(p)) == target_phone for p in phones):
             accounts = item.get("accounts") or []
             balance_raw = accounts[0].get("balance", "0") if accounts and isinstance(accounts[0], dict) else "0"
-            current_status = item.get("current_status") or {}
             car = item.get("car") or {}
             category = car.get("category") or profile.get("car_category") or "Курьер"
             city = profile.get("city") or "—"
@@ -1489,7 +1533,6 @@ def _extract_matches_in_park(
                     ] if x
                 ).strip() or "Курьер",
                 "work_status": work_status,
-                "line_status": current_status.get("status", "offline"),
                 "balance": _safe_float(balance_raw),
                 "city": city,
                 "category": category,
@@ -1521,11 +1564,25 @@ def _parse_order_dt(order: dict[str, Any]) -> Optional[datetime]:
     return None
 
 
+def _is_completed_order_status(status: str) -> bool:
+    s = (status or "").strip().lower()
+    return s in (
+        "complete",
+        "completed",
+        "finished",
+        "delivered",
+        "closed",
+        "done",
+        "выполнен",
+        "доставлен",
+    )
+
+
 async def _get_driver_orders_stats(
     session: aiohttp.ClientSession,
     park: dict[str, str],
     driver_id: str,
-    registered_dt: datetime,
+    goal_start_dt: datetime,
     force_refresh: bool = False,
 ) -> dict[str, Any]:
     cache_key = f"{park['park_id']}:{driver_id}"
@@ -1537,8 +1594,8 @@ async def _get_driver_orders_stats(
 
         now = datetime.now(timezone.utc)
         week_ago = now - timedelta(days=7)
-        reg_end = registered_dt + timedelta(days=GOAL_DAYS)
-        window_from = min(week_ago, registered_dt)
+        goal_end = goal_start_dt + timedelta(days=GOAL_DAYS)
+        window_from = min(week_ago, goal_start_dt)
         window_to = now
 
         payload = {
@@ -1567,47 +1624,43 @@ async def _get_driver_orders_stats(
                 "ok": False,
                 "error": str(exc),
                 "completed_7d": 0,
-                "completed_14d_from_reg": 0,
-                "within_14d_window": now <= reg_end,
-                "active_orders": [],
-                "earnings_7d": 0.0,
+                "completed_goal": 0,
+                "within_goal_window": now <= goal_end,
                 "distance_km_7d": 0.0,
             }
 
         completed_7d = 0
-        completed_14d_from_reg = 0
-        active_orders: list[str] = []
-        earnings_total = 0.0
+        completed_goal = 0
         distance_km_7d = 0.0
 
         for order in data.get("orders", []):
             if not isinstance(order, dict):
                 continue
-            status = order.get("status", "")
-            order_id = order.get("id", "—")
-            price = _safe_float(order.get("price") or order.get("driver_income") or order.get("cost"))
+            status = str(order.get("status") or "")
             dist_km = _extract_order_distance_km(order)
             odt = _parse_order_dt(order)
 
-            if status in ("complete", "finished", "delivered"):
+            if _is_completed_order_status(status):
                 if odt is None or odt >= week_ago:
                     completed_7d += 1
-                    earnings_total += price
                     distance_km_7d += dist_km
-                if odt is None or (registered_dt <= odt <= reg_end):
-                    completed_14d_from_reg += 1
-            elif status not in ("cancelled", "failed"):
-                active_orders.append(f"#{order_id} ({status})")
+                if odt is None or (goal_start_dt <= odt <= goal_end):
+                    completed_goal += 1
+
+        # Если API не вернул километраж по заказам (0.0), но заказы есть — подставляем среднюю оценку по заказам
+        distance_estimated = False
+        if completed_7d > 0 and distance_km_7d == 0.0:
+            distance_km_7d = round(completed_7d * 2.4, 1)
+            distance_estimated = True
 
         result = {
             "ok": True,
             "error": "",
             "completed_7d": completed_7d,
-            "completed_14d_from_reg": completed_14d_from_reg,
-            "within_14d_window": now <= reg_end,
-            "active_orders": active_orders,
-            "earnings_7d": round(earnings_total, 2),
+            "completed_goal": completed_goal,
+            "within_goal_window": now <= goal_end,
             "distance_km_7d": round(distance_km_7d, 1),
+            "distance_estimated": distance_estimated,
         }
         DRIVER_STATS_CACHE[cache_key] = {"ts": now_mono, "data": result}
         return result
@@ -1623,14 +1676,14 @@ def _format_dt_human(raw_dt: str) -> str:
         return raw_dt[:16].replace("T", " ")
 
 
-async def _get_driver_fines_list(
+async def _get_driver_adjustments_list(
     session: aiohttp.ClientSession,
     park: dict[str, str],
     driver_id: str,
     force_refresh: bool = False,
 ) -> list[str]:
-    """Возвращает список строк только по корректировкам/списаниям от Яндекса."""
-    cache_key = f"fines_v2:{park['park_id']}:{driver_id}"
+    """Возвращает список строк строго по корректировкам и штрафам/нарушениям."""
+    cache_key = f"adj_v3:{park['park_id']}:{driver_id}"
     now_mono = time.monotonic()
     cached = DRIVER_FINES_CACHE.get(cache_key)
     if not force_refresh and cached and (now_mono - cached["ts"]) < DRIVER_FINES_TTL_SEC:
@@ -1671,28 +1724,47 @@ async def _get_driver_fines_list(
         except Exception:
             continue
 
+    # Строго отсекаем налоги, переводы, выплаты и комиссии
+    excluded_words = (
+        "налог",
+        "ндфл",
+        "самозанят",
+        "псмз",
+        "перевод",
+        "вывод",
+        "выплат",
+        "комисс",
+        "парк",
+        "бонус",
+        "чаев",
+        "заказ",
+    )
+    adjustment_words = (
+        "корректиров",
+        "штраф",
+        "fine",
+        "penalty",
+        "наруш",
+        "отмен",
+        "недовоз",
+        "опозд",
+    )
+
     lines: list[str] = []
     for tx in tx_list:
-        cat_name = str(
-            tx.get("category_name")
-            or tx.get("category_id")
-            or tx.get("code")
-            or ""
-        ).strip()
+        cat_name = str(tx.get("category_name") or "").strip()
         desc = str(tx.get("description") or tx.get("comment") or tx.get("reason") or "").strip()
         amount = _safe_float(tx.get("amount") or tx.get("value") or tx.get("sum") or 0)
         dt_str = _format_dt_human(str(tx.get("event_at") or tx.get("created_at") or ""))
 
         low_all = f"{cat_name} {desc}".lower()
-        is_fine_or_adj = (
-            any(w in low_all for w in ("штраф", "fine", "penalty", "списан", "наруш", "корректиров", "удержан"))
-            or amount < 0
-        )
+        if any(ex in low_all for ex in excluded_words):
+            continue
 
-        if is_fine_or_adj and amount != 0:
+        if any(aw in low_all for aw in adjustment_words) and amount != 0:
             rub_val = f"{abs(amount):.2f} ₽"
-            reason = desc or cat_name or "нарушение / корректировка"
-            lines.append(f"Списано {rub_val}, {reason}, {dt_str}.")
+            violation = desc or cat_name or "корректировка"
+            lines.append(f"Списано {rub_val}, {violation}, {dt_str}.")
 
     DRIVER_FINES_CACHE[cache_key] = {"ts": now_mono, "lines": lines[:20]}
     return lines[:20]
@@ -1702,8 +1774,8 @@ async def _get_driver_fines_list(
 async def send_start_menu(chat_id: int | str, first_name: str = "друг") -> None:
     clear_user_state(chat_id)
     text = (
-        f"Привет, {first_name}!\n\n"
-        "Официальный бот парка ЛунапаркЕда. Выберите нужный раздел:"
+        f"Привет, {first_name}! 👋\n\n"
+        "Это официальный бот парка ЛунапаркЕда. Выбирай, что нужно сейчас:"
     )
     await tg_send_text(chat_id, text, reply_markup=kb_start_menu())
 
@@ -1729,33 +1801,39 @@ async def show_confirmation_screen(chat_id: int | str, data: dict[str, Any]) -> 
 
 
 async def show_courier_welcome(chat_id: int | str, driver: dict[str, Any]) -> None:
-    """Приветствие сразу после подтверждения, что пользователь — курьер (без мгновенной выгрузки статистики)."""
+    """Дружелюбное приветствие на «ты» с эмодзи после подтверждения профиля курьера."""
     first_name = _short_first_name(driver["full_name"])
     text = (
-        f"Добро пожаловать, {first_name}!\n"
-        "В боте можешь смотреть статистику поездок, цели, проверять на линии ли вы, и по вопросам писать в поддержку парка."
+        f"Добро пожаловать, {first_name}! 🎉\n\n"
+        "Рады видеть тебя в парке! Здесь ты можешь легко смотреть статистику поездок 📊, "
+        "следить за целями и бонусами 🎯, проверять корректировки ⚖️ и писать в поддержку, "
+        "если понадобится помощь 💬."
     )
     await tg_send_text(chat_id, text, reply_markup=kb_courier_cabinet())
 
 
 async def show_courier_statistics(chat_id: int | str, driver: dict[str, Any]) -> None:
-    """Только парк, баланс, заказы и километраж."""
+    """Живая статистика на «ты» с эмодзи: парк, баланс, заказы и километраж."""
     park = get_park_by_id(driver["park_id"])
-    reg_dt = get_registered_dt(chat_id)
+    goal_start = get_goal_start_dt(chat_id)
     try:
         async with aiohttp.ClientSession() as session:
-            stats = await _get_driver_orders_stats(session, park, driver["id"], registered_dt=reg_dt)
+            stats = await _get_driver_orders_stats(session, park, driver["id"], goal_start_dt=goal_start)
     except Exception:
         stats = {
             "completed_7d": 0,
             "distance_km_7d": 0.0,
+            "distance_estimated": False,
         }
 
+    km_suffix = " км (примерно)" if stats.get("distance_estimated") else " км"
     text = (
-        f"Парк: {driver['park_name']}\n"
-        f"Баланс: {driver['balance']:.2f} ₽\n"
-        f"Заказы (7 дней): {stats['completed_7d']}\n"
-        f"Км (7 дней): {stats['distance_km_7d']:.1f} км"
+        "Вот твоя свежая сводка за последние 7 дней ✨\n\n"
+        f"🏢 Парк: {driver['park_name']}\n"
+        f"💳 Баланс: {driver['balance']:.2f} ₽\n"
+        f"📦 Заказов выполнено: {stats['completed_7d']}\n"
+        f"🛣 Прошёл / проехал: {stats['distance_km_7d']:.1f}{km_suffix}\n\n"
+        "Отличный темп! Если захочешь посмотреть прогресс по бонусу — жми «🎁 Цель»."
     )
     await tg_send_text(chat_id, text, reply_markup=kb_courier_cabinet())
 
@@ -1767,7 +1845,7 @@ async def get_saved_profile_or_redirect(chat_id: int | str) -> dict[str, Any] | 
         set_user_state(chat_id, "courier_auth_phone", {})
         await send_ephemeral_text(
             chat_id,
-            "Отправьте номер профиля кнопкой или введите вручную:",
+            "Скинь номер профиля кнопкой ниже или напиши его текстом:",
             reply_markup=kb_courier_phone_auth(),
         )
         return None
@@ -1788,7 +1866,7 @@ async def get_saved_profile_or_redirect(chat_id: int | str) -> dict[str, Any] | 
 async def lookup_and_route_phone(chat_id: int | str, phone: str) -> None:
     await send_ephemeral_text(
         chat_id,
-        "Проверяю номер...",
+        "Секунду, проверяю номер в базе парка...",
         reply_markup=kb_courier_phone_auth(),
         ttl_sec=10,
     )
@@ -1798,7 +1876,7 @@ async def lookup_and_route_phone(chat_id: int | str, phone: str) -> None:
     except Exception as exc:
         await send_ephemeral_text(
             chat_id,
-            f"Ошибка проверки номера: {exc}",
+            f"Не получилось проверить номер: {exc}",
             reply_markup=kb_start_menu(),
         )
         return
@@ -1807,7 +1885,7 @@ async def lookup_and_route_phone(chat_id: int | str, phone: str) -> None:
         await tg_send_text(
             chat_id,
             "Этот номер не зарегистрирован в парке.\n\n"
-            "Хотите подключиться к парку? Нажмите «🚀 Подключиться».",
+            "Если хочешь стать частью команды — нажми «🚀 Подключиться», оформим всё за пару минут!",
             reply_markup=kb_not_found_connect(),
         )
         return
@@ -1820,7 +1898,7 @@ async def lookup_and_route_phone(chat_id: int | str, phone: str) -> None:
 
     PENDING_PROFILES[str(chat_id)] = profiles
     set_user_state(chat_id, "courier_pick_profile", {})
-    lines = ["Выберите один из предложенных профилей:\n"]
+    lines = ["Нашёл несколько профилей — выбери нужный:\n"]
     for idx, prof in enumerate(profiles[:10]):
         status_ru = "Работает" if prof["work_status"] == "working" else prof["work_status"]
         lines.append(
@@ -1992,7 +2070,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "help_waiting_problem", {"prev_step": prev_step, "prev_data": prev_data})
         await tg_send_text(
             chat_id,
-            "Напишите ваш вопрос — подключим оператора и ответим вам здесь.",
+            "Напиши свой вопрос — подключим оператора и всё подскажем прямо здесь 🙌",
             reply_markup=kb_step_with_help(),
         )
         return
@@ -2004,7 +2082,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     if norm_cmd in ("отмена", "отменить", "cancel"):
         if step == "help_waiting_problem" and data.get("prev_step"):
             set_user_state(chat_id, data["prev_step"], data.get("prev_data") or {})
-            await send_ephemeral_text(chat_id, "Отменено.", reply_markup=kb_step_with_help(), ttl_sec=8)
+            await send_ephemeral_text(chat_id, "Отменили, продолжаем 👍", reply_markup=kb_step_with_help(), ttl_sec=8)
             return
         await send_start_menu(chat_id, first_name=first_name)
         return
@@ -2013,7 +2091,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if not raw_text and not file_id:
             await send_ephemeral_text(
                 chat_id,
-                "Напишите текстом или отправьте фото:",
+                "Напиши текстом или скинь скриншот, что случилось:",
                 reply_markup=kb_step_with_help(),
                 ttl_sec=10,
             )
@@ -2058,7 +2136,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
 
         await send_ephemeral_text(
             chat_id,
-            "Обращение принято! Оператор ответит вам здесь.",
+            "Приняли твой вопрос! Оператор скоро ответит здесь 💙",
             reply_markup=kb_start_menu(),
             ttl_sec=20,
         )
@@ -2077,7 +2155,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "reg_transport", {"return_to_confirm": False})
         await tg_send_text(
             chat_id,
-            "Шаг 1 из 4. Как планируете доставлять заказы?",
+            "Шаг 1 из 4. Как планируешь доставлять заказы? 🚀",
             reply_markup=kb_transport_choice(),
         )
         return
@@ -2086,7 +2164,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "courier_auth_phone", {})
         await send_ephemeral_text(
             chat_id,
-            "Нажмите «📱 Отправить номер профиля» или введите номер вручную:",
+            "Нажми «📱 Отправить номер профиля» или введи его вручную 👇",
             reply_markup=kb_courier_phone_auth(),
             ttl_sec=30,
         )
@@ -2098,62 +2176,35 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             await show_courier_statistics(chat_id, driver)
         return
 
-    if norm_cmd in ("я на линии?", "я на линии", "статус линии", "линия"):
-        driver = await get_saved_profile_or_redirect(chat_id)
-        if not driver:
-            return
-        park = get_park_by_id(driver["park_id"])
-        reg_dt = get_registered_dt(chat_id)
-        try:
-            async with aiohttp.ClientSession() as session:
-                stats = await _get_driver_orders_stats(session, park, driver["id"], registered_dt=reg_dt)
-        except Exception as exc:
-            await send_ephemeral_text(chat_id, f"Ошибка проверки линии: {exc}", reply_markup=kb_courier_cabinet())
-            return
-
-        line_map = {
-            "online": "На линии",
-            "busy": "На заказе",
-            "offline": "Не на линии",
-        }
-        line_human = line_map.get(driver["line_status"], driver["line_status"])
-        active_info = "\n".join(o for o in stats["active_orders"]) if stats["active_orders"] else "Нет активных заказов"
-        resp_text = (
-            f"Статус: {line_human}\n"
-            f"Заказы: {active_info}"
-        )
-        await tg_send_text(chat_id, resp_text, reply_markup=kb_courier_cabinet())
-        return
-
     if norm_cmd in ("цель", "бонус", "моя цель"):
         driver = await get_saved_profile_or_redirect(chat_id)
         if not driver:
             return
         park = get_park_by_id(driver["park_id"])
-        reg_dt = get_registered_dt(chat_id)
+        goal_start = get_goal_start_dt(chat_id)
         try:
             async with aiohttp.ClientSession() as session:
-                stats = await _get_driver_orders_stats(session, park, driver["id"], registered_dt=reg_dt)
+                stats = await _get_driver_orders_stats(session, park, driver["id"], goal_start_dt=goal_start)
         except Exception as exc:
-            await send_ephemeral_text(chat_id, f"Ошибка: {exc}", reply_markup=kb_courier_cabinet())
+            await send_ephemeral_text(chat_id, f"Не вышло посчитать цель: {exc}", reply_markup=kb_courier_cabinet())
             return
 
-        done = stats["completed_14d_from_reg"]
+        done = stats["completed_goal"]
         left = max(0, GOAL_ORDERS - done)
         filled = min(GOAL_ORDERS, done)
         bar = "🟩" * filled + "⬜" * (GOAL_ORDERS - filled)
-        reg_str = reg_dt.astimezone().strftime("%d.%m.%Y")
+        start_str = goal_start.astimezone().strftime("%d.%m.%Y")
         if left == 0:
-            status_line = f"Цель выполнена: +{GOAL_BONUS} ₽"
-        elif not stats["within_14d_window"]:
-            status_line = f"Срок {GOAL_DAYS} дней (от {reg_str}) завершён."
+            status_line = f"🎉 Супер! Цель закрыта, бонус +{GOAL_BONUS} ₽ твой!"
+        elif not stats["within_goal_window"]:
+            status_line = f"Срок {GOAL_DAYS} дней (с {start_str}) уже прошёл."
         else:
-            status_line = f"Осталось: {left} заказ(ов) за {GOAL_DAYS} дней (от {reg_str}) до +{GOAL_BONUS} ₽"
+            status_line = f"Осталось выполнить {left} заказ(ов) за {GOAL_DAYS} дней (отсчёт с {start_str}) до бонуса +{GOAL_BONUS} ₽ 💪"
 
         resp_text = (
-            f"{GOAL_ORDERS} заказов за {GOAL_DAYS} дней (+{GOAL_BONUS} ₽)\n"
-            f"{done} / {GOAL_ORDERS}\n"
-            f"{bar}\n"
+            f"🎁 Твоя цель: {GOAL_ORDERS} заказов за {GOAL_DAYS} дней (+{GOAL_BONUS} ₽)\n\n"
+            f"Прогресс: {done} / {GOAL_ORDERS}\n"
+            f"{bar}\n\n"
             f"{status_line}"
         )
         await tg_send_text(chat_id, resp_text, reply_markup=kb_courier_cabinet())
@@ -2166,12 +2217,12 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         park = get_park_by_id(driver["park_id"])
         try:
             async with aiohttp.ClientSession() as session:
-                lines = await _get_driver_fines_list(session, park, driver["id"], force_refresh=True)
+                lines = await _get_driver_adjustments_list(session, park, driver["id"], force_refresh=True)
         except Exception:
             lines = []
 
         if not lines:
-            await tg_send_text(chat_id, "Списаний и корректировок нет.", reply_markup=kb_courier_cabinet())
+            await tg_send_text(chat_id, "Корректировок и списаний нет.", reply_markup=kb_courier_cabinet())
             return
 
         await tg_send_text(chat_id, "\n".join(lines), reply_markup=kb_courier_cabinet())
@@ -2182,7 +2233,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if len(re.sub(r"\D", "", raw_phone)) < 10:
             await send_ephemeral_text(
                 chat_id,
-                "Введите номер в формате +7 999 123-45-67 или нажмите кнопку отправки номера:",
+                "Введи номер в формате +7 999 123-45-67 или нажми кнопку отправки номера:",
                 reply_markup=kb_courier_phone_auth(),
                 ttl_sec=15,
             )
@@ -2196,7 +2247,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             set_user_state(chat_id, "courier_auth_phone", {})
             await send_ephemeral_text(
                 chat_id,
-                "Нажмите «📱 Отправить номер профиля» или введите номер вручную:",
+                "Нажми «📱 Отправить номер профиля» или введи номер вручную:",
                 reply_markup=kb_courier_phone_auth(),
                 ttl_sec=25,
             )
@@ -2206,7 +2257,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if not m or int(m.group(1)) < 1 or int(m.group(1)) > len(profiles):
             await send_ephemeral_text(
                 chat_id,
-                "Выберите профиль на клавиатуре или напишите его номер:",
+                "Выбери профиль на клавиатуре или напиши его номер:",
                 reply_markup=kb_profiles_choice(profiles) if profiles else kb_start_menu(),
                 ttl_sec=15,
             )
@@ -2222,7 +2273,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if not chosen_transport:
             await send_ephemeral_text(
                 chat_id,
-                "Выберите формат доставки на клавиатуре:",
+                "Выбери формат доставки на клавиатуре:",
                 reply_markup=kb_transport_choice(),
                 ttl_sec=15,
             )
@@ -2233,7 +2284,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
                 set_user_state(chat_id, "reg_sts_front", data)
                 await tg_send_text(
                     chat_id,
-                    "Для выбранного формата нужно фото СТС с двух сторон. Пришлите лицевую сторону (1 из 2):",
+                    "Для выбранного формата нужно фото СТС с двух сторон. Пришли лицевую сторону (1 из 2):",
                     reply_markup=kb_step_with_help(),
                 )
                 return
@@ -2242,14 +2293,14 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "reg_city", data)
         await tg_send_text(
             chat_id,
-            "Шаг 2 из 4. В каком городе планируете работать?",
+            "Шаг 2 из 4. В каком городе планируешь работать? 🏙",
             reply_markup=kb_step_with_help(),
         )
         return
 
     if step == "reg_city":
         if len(raw_text) < 2:
-            await send_ephemeral_text(chat_id, "Напишите корректное название города:", reply_markup=kb_step_with_help(), ttl_sec=15)
+            await send_ephemeral_text(chat_id, "Напиши корректное название города:", reply_markup=kb_step_with_help(), ttl_sec=15)
             return
         data = update_user_state_data(chat_id, city=raw_text)
         if data.get("return_to_confirm"):
@@ -2258,14 +2309,14 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "reg_name", data)
         await tg_send_text(
             chat_id,
-            "Шаг 3 из 4. Напишите ваши Фамилию и Имя:",
+            "Шаг 3 из 4. Как тебя зовут? Напиши Фамилию и Имя:",
             reply_markup=kb_step_with_help(),
         )
         return
 
     if step == "reg_name":
         if len(raw_text) < 2:
-            await send_ephemeral_text(chat_id, "Напишите ваши Фамилию и Имя:", reply_markup=kb_step_with_help(), ttl_sec=15)
+            await send_ephemeral_text(chat_id, "Напиши свои Фамилию и Имя:", reply_markup=kb_step_with_help(), ttl_sec=15)
             return
         data = update_user_state_data(chat_id, name=raw_text)
         if data.get("return_to_confirm"):
@@ -2274,7 +2325,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "reg_phone", data)
         await tg_send_text(
             chat_id,
-            "Шаг 4 из 4. Введите ваш номер телефона (например, +7 999 123-45-67):",
+            "Шаг 4 из 4. Введи номер телефона (например, +7 999 123-45-67) 📱:",
             reply_markup=kb_step_with_help(),
         )
         return
@@ -2284,7 +2335,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if len(re.sub(r"\D", "", raw_phone)) < 10:
             await send_ephemeral_text(
                 chat_id,
-                "Номер введён не полностью. Введите номер в формате +7 999 123-45-67:",
+                "Номер введён не полностью. Введи номер в формате +7 999 123-45-67:",
                 reply_markup=kb_step_with_help(),
                 ttl_sec=15,
             )
@@ -2297,7 +2348,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             set_user_state(chat_id, "reg_sts_front", data)
             await tg_send_text(
                 chat_id,
-                "Пришлите фото СТС — сначала лицевую сторону (1 из 2):",
+                "Пришли фото СТС — сначала лицевую сторону (1 из 2):",
                 reply_markup=kb_step_with_help(),
             )
             return
@@ -2308,7 +2359,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if not file_id:
             await send_ephemeral_text(
                 chat_id,
-                "Пришлите фото лицевой стороны СТС (1 из 2):",
+                "Пришли фото лицевой стороны СТС (1 из 2):",
                 reply_markup=kb_step_with_help(),
                 ttl_sec=15,
             )
@@ -2317,7 +2368,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "reg_sts_back", data)
         await tg_send_text(
             chat_id,
-            "Отлично! Теперь пришлите фото обратной стороны СТС (2 из 2):",
+            "Отлично! Теперь пришли фото обратной стороны СТС (2 из 2):",
             reply_markup=kb_step_with_help(),
         )
         return
@@ -2326,7 +2377,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if not file_id:
             await send_ephemeral_text(
                 chat_id,
-                "Пришлите фото обратной стороны СТС (2 из 2):",
+                "Пришли фото обратной стороны СТС (2 из 2):",
                 reply_markup=kb_step_with_help(),
                 ttl_sec=15,
             )
@@ -2341,7 +2392,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             set_user_state(chat_id, "reg_choosing_edit", data)
             await tg_send_text(
                 chat_id,
-                "Что хотите изменить?",
+                "Что хочешь изменить?",
                 reply_markup=kb_edit_field_choice(data),
             )
             return
@@ -2350,7 +2401,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             return
         await send_ephemeral_text(
             chat_id,
-            "Нажмите «Да», если данные верны, или «Исправить»:",
+            "Нажми «Да», если всё верно, или «Исправить»:",
             reply_markup=kb_confirm_application(),
             ttl_sec=15,
         )
@@ -2362,29 +2413,29 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             return
         if norm_cmd in ("изменить формат", "формат", "транспорт"):
             set_user_state(chat_id, "reg_transport", data)
-            await tg_send_text(chat_id, "Выберите новый формат доставки:", reply_markup=kb_transport_choice())
+            await tg_send_text(chat_id, "Выбери новый формат доставки:", reply_markup=kb_transport_choice())
             return
         if norm_cmd in ("изменить город", "город"):
             set_user_state(chat_id, "reg_city", data)
-            await tg_send_text(chat_id, "Введите новый город:", reply_markup=kb_step_with_help())
+            await tg_send_text(chat_id, "Введи новый город:", reply_markup=kb_step_with_help())
             return
         if norm_cmd in ("изменить имя", "имя"):
             set_user_state(chat_id, "reg_name", data)
-            await tg_send_text(chat_id, "Введите новые Фамилию и Имя:", reply_markup=kb_step_with_help())
+            await tg_send_text(chat_id, "Введи новые Фамилию и Имя:", reply_markup=kb_step_with_help())
             return
         if norm_cmd in ("изменить телефон", "телефон"):
             set_user_state(chat_id, "reg_phone", data)
-            await tg_send_text(chat_id, "Отправьте новый номер телефона:", reply_markup=kb_step_with_help())
+            await tg_send_text(chat_id, "Отправь новый номер телефона:", reply_markup=kb_step_with_help())
             return
         if norm_cmd in ("изменить фото стс", "фото стс", "стс"):
             set_user_state(chat_id, "reg_sts_front", data)
             await tg_send_text(
                 chat_id,
-                "Пришлите новое фото лицевой стороны СТС (1 из 2):",
+                "Пришли новое фото лицевой стороны СТС (1 из 2):",
                 reply_markup=kb_step_with_help(),
             )
             return
-        await send_ephemeral_text(chat_id, "Выберите поле для изменения:", reply_markup=kb_edit_field_choice(data), ttl_sec=15)
+        await send_ephemeral_text(chat_id, "Выбери поле для изменения:", reply_markup=kb_edit_field_choice(data), ttl_sec=15)
         return
 
     await send_start_menu(chat_id, first_name=first_name)
