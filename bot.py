@@ -39,9 +39,9 @@ AMOCRM_ACCESS_TOKEN = os.getenv(
     "AMOCRM_ACCESS_TOKEN",
     "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImp0aSI6ImQ3NDM4MThmM2IxMzMxYTE2ZDUwZDRhMDA5ZWI3ZmQ1OTI3YTQ5YTljMDE4OWMwZGY5NjY2YTM2OTU4YjdiYjA1ZjhkNmM2MjkyZDY3MjM2In0.eyJhdWQiOiI3NjNkNmJjNC1mMGVmLTQwY2EtYjg3Mi01MmMzMmY5MWM5MTQiLCJqdGkiOiJkNzQzODE4ZjNiMTMzMWExNmQ1MGQ0YTAwOWViN2ZkNTkyN2E0OWE5YzAxODljMGRmOTY2NmEzNjk1OGI3YmIwNWY4ZDZjNjI5MmQ2NzIzNiIsImlhdCI6MTc5NTMzMDQyNiwibmJmIjoxNzk1MzMwNDI2LCJleHAiOjE5NDc2Mjg4MDAsInN1YiI6IjEyNjQ1NDY2IiwiZ3JhbnRfdHlwZSI6IiIsImFjY291bnRfaWQiOjMxMjkwOTc0LCJiYXNlX2RvbWFpbiI6ImFtb2NybS5ydSIsInZlcnNpb24iOjIsInNjb3BlcyI6WyJwdXNoX25vdGlmaWNhdGlvbnMiLCJmaWxlcyIsImNybSIsImZpbGVzX2RlbGV0ZSIsIm5vdGlmaWNhdGlvbnMiXSwiaGFzaF91dWlkIjoiMDFjMWE3MWEtZWI5Yy00MjJjLTg4ODEtMGQ2Mjg3ZDA2ODA2IiwiYXBpX2RvbWFpbiI6ImFwaS1iLmFtb2NybS5ydSJ9.TyjWbPrNmzDY_yUNQwEFO-8kWSW0MNHyoF_Xd5Vir0TRTfhpLGcpUOAKKPRvLvpESIO1wJ-lUXMcmawGdiLFbKLTqQv3djdWUc2vypbZZVsHKXT2_ZHhaLyxYHNtWB-HJ1Z_F8TB404KqnjlQ2n6opAlu5HMdHpamquMn3AJUcZAqMTknQ8_mlaiMQRUvhD1Dvn6XRtJ9SETH3a78QUQbpj__qc-HOT_b91eLHgjUIV6uLVqRyMFioPjrpY0jpZnAk4CLRoClNZPqml5qbcSnFfJuLBD763O5JoprazMnIWIR_r80Nc7DpLLZk3Eb_yXKTiRqj67lskDtvoM6q19zQ",
 )
-AMOCRM_PIPELINE_ID = 10053610  # Яндекс еда
-AMOCRM_STATUS_ID = 79731826    # Новый лид
-AMOCRM_CLOSED_LOST_ID = 143    # Закрыто и не реализовано
+AMOCRM_PIPELINE_ID = int(os.getenv("AMOCRM_PIPELINE_ID", "10053610"))  # Яндекс еда
+AMOCRM_STATUS_ID = int(os.getenv("AMOCRM_STATUS_ID", "79731826"))        # Новый лид
+AMOCRM_CLOSED_LOST_ID = int(os.getenv("AMOCRM_CLOSED_LOST_ID", "143"))   # Закрыто и не реализовано
 AMOCRM_TELEGRAM_FIELD_ID: int | None = None
 
 USERS_FILE = "users_db.json"
@@ -106,7 +106,7 @@ MSG_PROFILE_CREATED_10M = (
 )
 
 
-# ================= КЛАВИАТУРЫ (КНОПКИ WAZZUP TELEGRAM) =================
+# ================= КЛАВИАТУРЫ И ВАРИАНТЫ ОТВЕТА =================
 def kb_start_menu() -> list[list[str]]:
     return [
         ["🚀 Подключиться к парку", "✅ Уже курьер парка"],
@@ -160,6 +160,49 @@ def kb_profiles_choice(profiles: list[dict[str, Any]]) -> list[list[str]]:
     return rows
 
 
+def normalize_choice_text(raw: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (raw or "").strip().lower())
+    cleaned = re.sub(r"^[^\wа-яёa-z0-9]+", "", cleaned).strip()
+    return cleaned
+
+
+def parse_transport_choice(raw: str) -> str | None:
+    norm = normalize_choice_text(raw)
+    if not norm:
+        return None
+    mapping = {
+        "пеший / вело": "🚶 Пеший / Вело",
+        "пеший": "🚶 Пеший / Вело",
+        "вело": "🚶 Пеший / Вело",
+        "велосипед": "🚶 Пеший / Вело",
+        "1": "🚶 Пеший / Вело",
+        "мото": "🛵 Мото",
+        "мотоцикл": "🛵 Мото",
+        "скутер": "🛵 Мото",
+        "2": "🛵 Мото",
+        "авто": "🚗 Авто",
+        "автомобиль": "🚗 Авто",
+        "легковой": "🚗 Авто",
+        "машина": "🚗 Авто",
+        "3": "🚗 Авто",
+        "грузовой": "🚚 Грузовой",
+        "груз": "🚚 Грузовой",
+        "грузовик": "🚚 Грузовой",
+        "4": "🚚 Грузовой",
+    }
+    if norm in mapping:
+        return mapping[norm]
+    if "пеш" in norm or "вел" in norm:
+        return "🚶 Пеший / Вело"
+    if "мот" in norm or "скут" in norm:
+        return "🛵 Мото"
+    if "груз" in norm:
+        return "🚚 Грузовой"
+    if "авто" in norm or "маш" in norm or "легк" in norm:
+        return "🚗 Авто"
+    return None
+
+
 # ================= БЕЗОПАСНАЯ РАБОТА С JSON И СОСТОЯНИЯМИ =================
 def _read_json(path: str, default: Any) -> Any:
     if not os.path.exists(path):
@@ -173,7 +216,10 @@ def _read_json(path: str, default: Any) -> Any:
 
 
 def _write_json(path: str, data: Any) -> None:
-    tmp_path = f"{path}.tmp"
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, path)
@@ -211,23 +257,33 @@ def requires_two_sided_sts(transport_text: str) -> bool:
 
 def get_user_state(chat_id: str) -> dict[str, Any]:
     states = _read_json(STATES_FILE, {})
-    return states.get(str(chat_id), {"step": None, "data": {}})
+    raw = states.get(str(chat_id))
+    if not isinstance(raw, dict):
+        return {"step": None, "data": {}}
+    data = raw.get("data")
+    return {"step": raw.get("step"), "data": data if isinstance(data, dict) else {}}
 
 
 def set_user_state(chat_id: str, step: str | None, data: dict[str, Any] | None = None) -> None:
     states = _read_json(STATES_FILE, {})
-    cur = states.get(str(chat_id), {"step": None, "data": {}})
+    cur = states.get(str(chat_id))
+    if not isinstance(cur, dict):
+        cur = {"step": None, "data": {}}
     cur["step"] = step
     if data is not None:
         cur["data"] = data
+    elif not isinstance(cur.get("data"), dict):
+        cur["data"] = {}
     states[str(chat_id)] = cur
     _write_json(STATES_FILE, states)
 
 
 def update_user_state_data(chat_id: str, **kwargs: Any) -> dict[str, Any]:
     states = _read_json(STATES_FILE, {})
-    cur = states.get(str(chat_id), {"step": None, "data": {}})
-    cur_data = cur.get("data") or {}
+    cur = states.get(str(chat_id))
+    if not isinstance(cur, dict):
+        cur = {"step": None, "data": {}}
+    cur_data = cur.get("data") if isinstance(cur.get("data"), dict) else {}
     cur_data.update(kwargs)
     cur["data"] = cur_data
     states[str(chat_id)] = cur
@@ -250,7 +306,9 @@ def save_user_session(
 ) -> dict[str, Any]:
     db = _read_json(USERS_FILE, {})
     key = str(chat_id)
-    entry = db.get(key, {})
+    entry = db.get(key)
+    if not isinstance(entry, dict):
+        entry = {}
     if not entry.get("registered_at"):
         entry["registered_at"] = datetime.now(timezone.utc).isoformat()
     if phone:
@@ -272,7 +330,8 @@ def save_user_session(
 
 def get_user_record(chat_id: str) -> dict[str, Any]:
     db = _read_json(USERS_FILE, {})
-    return db.get(str(chat_id), {})
+    rec = db.get(str(chat_id))
+    return rec if isinstance(rec, dict) else {}
 
 
 def get_registered_dt(chat_id: str) -> datetime:
@@ -290,9 +349,12 @@ def get_registered_dt(chat_id: str) -> datetime:
 
 def save_application(lead_payload: dict[str, Any]) -> None:
     apps = _read_json(APPS_FILE, [])
-    lead_payload["created_at"] = datetime.now().strftime("%d.%m.%Y %H:%M")
-    lead_payload["status"] = "Принята в работу"
-    apps.append(lead_payload)
+    if not isinstance(apps, list):
+        apps = []
+    record = dict(lead_payload)
+    record["created_at"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+    record["status"] = "Принята в работу"
+    apps.append(record)
     _write_json(APPS_FILE, apps)
 
 
@@ -310,8 +372,14 @@ def save_client_lead(chat_id: str, lead_id: int) -> None:
 
 
 # ================= ОТЛОЖЕННОЕ СООБЩЕНИЕ ЧЕРЕЗ 10 МИНУТ =================
-def schedule_delayed_profile_msg(chat_id: str, channel_id: str, delay_sec: int = PROFILE_READY_DELAY_SEC) -> None:
+def schedule_delayed_profile_msg(
+    chat_id: str,
+    channel_id: str,
+    delay_sec: int = PROFILE_READY_DELAY_SEC,
+) -> None:
     tasks = _read_json(DELAYED_TASKS_FILE, [])
+    if not isinstance(tasks, list):
+        tasks = []
     send_at = time.time() + delay_sec
     tasks.append({
         "id": str(uuid.uuid4()),
@@ -329,26 +397,34 @@ async def delayed_notifications_worker(app: web.Application) -> None:
         try:
             async with _FILE_LOCKS["delayed_tasks"]:
                 tasks = _read_json(DELAYED_TASKS_FILE, [])
-                if tasks:
+                if isinstance(tasks, list) and tasks:
                     now = time.time()
                     remaining = []
+                    changed = False
                     for task in tasks:
+                        if not isinstance(task, dict):
+                            changed = True
+                            continue
                         if now >= float(task.get("send_at", 0)):
-                            cid = str(task["chat_id"])
+                            cid = str(task.get("chat_id") or "")
                             ch_id = str(task.get("channel_id") or WAZZUP_CHANNEL_ID)
+                            txt = str(task.get("text") or MSG_PROFILE_CREATED_10M)
                             ok = await wazzup_send_text(
                                 chat_id=cid,
-                                text=task["text"],
+                                text=txt,
                                 buttons=kb_start_menu(),
                                 channel_id=ch_id,
                                 clear_unanswered=False,
                             )
-                            if not ok:
+                            if ok:
+                                changed = True
+                            else:
                                 task["send_at"] = now + 30
                                 remaining.append(task)
+                                changed = True
                         else:
                             remaining.append(task)
-                    if len(remaining) != len(tasks):
+                    if changed:
                         _write_json(DELAYED_TASKS_FILE, remaining)
         except asyncio.CancelledError:
             break
@@ -357,12 +433,41 @@ async def delayed_notifications_worker(app: web.Application) -> None:
         await asyncio.sleep(5)
 
 
-# ================= WAZZUP SIDECAR API (ОТПРАВКА И ВЕБХУКИ) =================
+# ================= WAZZUP API (ОТПРАВКА И ВЕБХУКИ) =================
 def _wazzup_headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {WAZZUP_API_KEY.strip()}",
         "Content-Type": "application/json",
     }
+
+
+async def _post_wazzup_message(
+    session: aiohttp.ClientSession,
+    ch: str,
+    chat_id: str,
+    text: str,
+    buttons: list[list[str]] | None,
+    clear_unanswered: bool,
+) -> tuple[bool, int, str]:
+    payload: dict[str, Any] = {
+        "channelId": ch,
+        "chatType": "telegram",
+        "chatId": str(chat_id),
+        "text": text,
+        "crmMessageId": str(uuid.uuid4()),
+        "clearUnanswered": clear_unanswered,
+    }
+    if buttons:
+        payload["buttons"] = buttons
+
+    async with session.post(
+        f"{WAZZUP_API_BASE}/message",
+        headers=_wazzup_headers(),
+        json=payload,
+        timeout=20,
+    ) as resp:
+        resp_text = await resp.text()
+        return resp.status in (200, 201), resp.status, resp_text
 
 
 async def wazzup_send_text(
@@ -377,30 +482,51 @@ async def wazzup_send_text(
         logger.error("Не заполнены WAZZUP_API_KEY или WAZZUP_CHANNEL_ID")
         return False
 
-    payload: dict[str, Any] = {
-        "channelId": ch,
-        "chatType": "telegram",
-        "chatId": str(chat_id),
-        "text": text,
-        "crmMessageId": str(uuid.uuid4()),
-        "clearUnanswered": clear_unanswered,
-    }
-    if buttons:
-        payload["buttons"] = buttons
-
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{WAZZUP_API_BASE}/message",
-                headers=_wazzup_headers(),
-                json=payload,
-                timeout=20,
-            ) as resp:
-                resp_text = await resp.text()
-                if resp.status not in (200, 201):
-                    logger.error("Ошибка Wazzup POST /v3/message (%s): %s", resp.status, resp_text[:300])
-                    return False
+            ok, status, resp_text = await _post_wazzup_message(
+                session=session,
+                ch=ch,
+                chat_id=str(chat_id),
+                text=text,
+                buttons=buttons,
+                clear_unanswered=clear_unanswered,
+            )
+            if ok:
+                logger.info("Wazzup POST /v3/message (%s) -> chatId=%s", status, chat_id)
                 return True
+
+            logger.warning(
+                "Wazzup POST /v3/message с кнопками вернул (%s): %s",
+                status,
+                resp_text[:300],
+            )
+            # Если передавались кнопки и Wazzup отклонил запрос из-за них — повторяем отправку без buttons
+            if buttons:
+                ok_no_btn, status_no_btn, resp_no_btn = await _post_wazzup_message(
+                    session=session,
+                    ch=ch,
+                    chat_id=str(chat_id),
+                    text=text,
+                    buttons=None,
+                    clear_unanswered=clear_unanswered,
+                )
+                if ok_no_btn:
+                    logger.info(
+                        "Wazzup POST /v3/message без кнопок прошёл (%s) -> chatId=%s",
+                        status_no_btn,
+                        chat_id,
+                    )
+                    return True
+                logger.error(
+                    "Ошибка Wazzup POST /v3/message без кнопок (%s): %s",
+                    status_no_btn,
+                    resp_no_btn[:300],
+                )
+                return False
+
+            logger.error("Ошибка Wazzup POST /v3/message (%s): %s", status, resp_text[:300])
+            return False
     except Exception as exc:
         logger.exception("Исключение при отправке в Wazzup: %s", exc)
         return False
@@ -488,7 +614,15 @@ async def _detect_tg_custom_field_id(
             data = await resp.json()
             for f_item in data.get("_embedded", {}).get("custom_fields", []):
                 fname = (f_item.get("name") or "").lower().strip()
-                if fname in ("telegram", "телеграм", "тг", "tg", "аккаунт telegram", "telegram аккаунт", "логин telegram"):
+                if fname in (
+                    "telegram",
+                    "телеграм",
+                    "тг",
+                    "tg",
+                    "аккаунт telegram",
+                    "telegram аккаунт",
+                    "логин telegram",
+                ):
                     fid = int(f_item["id"])
                     _DETECTED_TG_FIELD_CACHE[entity_type] = fid
                     return fid
@@ -972,16 +1106,18 @@ async def get_cached_drivers(
         return mem["data"]
 
     disk_all = _read_json(DRIVERS_CACHE_FILE, {})
-    disk_entry = disk_all.get(pid, {})
-    disk_ts = disk_entry.get("updated_at", 0.0)
-    disk_profiles = disk_entry.get("profiles", [])
+    disk_entry = disk_all.get(pid, {}) if isinstance(disk_all, dict) else {}
+    disk_ts = disk_entry.get("updated_at", 0.0) if isinstance(disk_entry, dict) else 0.0
+    disk_profiles = disk_entry.get("profiles", []) if isinstance(disk_entry, dict) else []
 
-    if not force_refresh and disk_profiles and (time.time() - disk_ts) < DRIVERS_TTL_SEC:
+    if not force_refresh and disk_profiles and (time.time() - float(disk_ts or 0.0)) < DRIVERS_TTL_SEC:
         DRIVERS_CACHE[pid] = {"ts": now, "data": disk_profiles}
         return disk_profiles
 
     try:
-        drivers = await _fetch_all_drivers_for_park(session, park, partial_fallback=disk_profiles or (mem or {}).get("data"))
+        drivers = await _fetch_all_drivers_for_park(
+            session, park, partial_fallback=disk_profiles or (mem or {}).get("data")
+        )
     except RuntimeError as exc:
         if "429" in str(exc) and (disk_profiles or (mem or {}).get("data")):
             return (mem or {}).get("data") or disk_profiles
@@ -989,19 +1125,27 @@ async def get_cached_drivers(
 
     if drivers:
         DRIVERS_CACHE[pid] = {"ts": now, "data": drivers}
+        if not isinstance(disk_all, dict):
+            disk_all = {}
         disk_all[pid] = {"updated_at": time.time(), "profiles": drivers}
         _write_json(DRIVERS_CACHE_FILE, disk_all)
     return drivers
 
 
-def _extract_matches_in_park(park: dict[str, str], drivers: list[dict[str, Any]], target_phone: str) -> list[dict[str, Any]]:
+def _extract_matches_in_park(
+    park: dict[str, str],
+    drivers: list[dict[str, Any]],
+    target_phone: str,
+) -> list[dict[str, Any]]:
     matches: list[dict[str, Any]] = []
     for item in drivers:
-        profile = item.get("driver_profile", {})
-        phones = profile.get("phones", []) or []
+        if not isinstance(item, dict):
+            continue
+        profile = item.get("driver_profile") or {}
+        phones = profile.get("phones") or []
         if any(normalize_phone(str(p)) == target_phone for p in phones):
             accounts = item.get("accounts") or []
-            balance_raw = accounts[0].get("balance", "0") if accounts else "0"
+            balance_raw = accounts[0].get("balance", "0") if accounts and isinstance(accounts[0], dict) else "0"
             current_status = item.get("current_status") or {}
             car = item.get("car") or {}
             category = car.get("category") or profile.get("car_category") or "Курьер"
@@ -1029,7 +1173,10 @@ def _extract_matches_in_park(park: dict[str, str], drivers: list[dict[str, Any]]
     return matches
 
 
-async def _find_all_profiles_by_phone(session: aiohttp.ClientSession, target_phone: str) -> list[dict[str, Any]]:
+async def _find_all_profiles_by_phone(
+    session: aiohttp.ClientSession,
+    target_phone: str,
+) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
     for park in PARKS_CONFIG:
         drivers = await get_cached_drivers(session, park, force_refresh=False)
@@ -1109,6 +1256,8 @@ async def _get_driver_orders_stats(
         earnings_total = 0.0
 
         for order in data.get("orders", []):
+            if not isinstance(order, dict):
+                continue
             status = order.get("status", "")
             order_id = order.get("id", "—")
             price = _safe_float(order.get("price") or order.get("driver_income") or order.get("cost"))
@@ -1152,7 +1301,7 @@ async def show_confirmation_screen(chat_id: str, channel_id: str, data: dict[str
         f"Формат: {data.get('transport', '—')}\n"
         f"Телефон: {data.get('phone', '—')}"
         f"{sts_line}\n"
-        "Всё верно?"
+        "Всё верно? Напишите или нажмите «Да» / «Исправить»."
     )
     await wazzup_send_text(chat_id, text, buttons=kb_confirm_application(), channel_id=channel_id)
 
@@ -1187,7 +1336,7 @@ async def show_cabinet_for_profile(chat_id: str, channel_id: str, driver: dict[s
         f"🏢 Парк: {driver['park_name']}\n\n"
         f"💳 Баланс: {driver['balance']:.2f} ₽\n"
         f"{orders_block}\n"
-        "Кабинет курьера открыт — выбирайте нужный раздел в меню ниже 👇"
+        "Кабинет курьера открыт — выбирайте нужный раздел в меню 👇"
     )
     await wazzup_send_text(chat_id, text, buttons=kb_courier_cabinet(), channel_id=channel_id)
 
@@ -1288,9 +1437,9 @@ async def finalize_registration(
     tg_login = format_tg_login(chat_id, tg_username)
     lead_payload = {
         "type": "Подключение",
-        "name": data["name"],
-        "city": data["city"],
-        "transport": data["transport"],
+        "name": data.get("name", ""),
+        "city": data.get("city", ""),
+        "transport": data.get("transport", ""),
         "phone": norm_phone,
         "tg_username": tg_login,
         "tg_id": chat_id,
@@ -1322,14 +1471,57 @@ async def finalize_registration(
     schedule_delayed_profile_msg(chat_id, channel_id, delay_sec=PROFILE_READY_DELAY_SEC)
 
 
+def _extract_incoming_fields(msg: dict[str, Any]) -> tuple[str, str, str, str, str, str, str]:
+    chat_id = str(msg.get("chatId") or msg.get("chat_id") or "").strip()
+    channel_id = str(msg.get("channelId") or msg.get("channel_id") or WAZZUP_CHANNEL_ID).strip()
+
+    raw_text = msg.get("text")
+    if raw_text is None and isinstance(msg.get("message"), dict):
+        raw_text = msg["message"].get("text")
+    text = str(raw_text or "").strip()
+
+    content_uri = str(msg.get("contentUri") or msg.get("fileUri") or msg.get("url") or "").strip()
+
+    contact_info = msg.get("contact") if isinstance(msg.get("contact"), dict) else {}
+    author_info = msg.get("author") if isinstance(msg.get("author"), dict) else {}
+
+    tg_username = str(
+        contact_info.get("username")
+        or author_info.get("username")
+        or msg.get("username")
+        or ""
+    ).strip()
+
+    contact_name = str(
+        contact_info.get("name")
+        or author_info.get("name")
+        or msg.get("senderName")
+        or "Пользователь"
+    ).strip()
+
+    contact_phone = str(
+        contact_info.get("phone")
+        or author_info.get("phone")
+        or msg.get("phone")
+        or ""
+    ).strip()
+
+    return chat_id, channel_id, text, content_uri, tg_username, contact_name, contact_phone
+
+
 async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
-    # Игнорируем исходящие (isEcho=True) и не-telegram каналы
-    if msg.get("isEcho") is True:
-        return
-    if msg.get("chatType") != "telegram":
+    if not isinstance(msg, dict):
         return
 
-    msg_id = str(msg.get("messageId") or "")
+    # Игнорируем исходящие (isEcho=True)
+    if msg.get("isEcho") is True:
+        return
+
+    chat_type = str(msg.get("chatType") or msg.get("channelType") or "").lower().strip()
+    if chat_type and chat_type not in ("telegram", "tg"):
+        return
+
+    msg_id = str(msg.get("messageId") or msg.get("id") or "").strip()
     now_ts = time.monotonic()
     if msg_id:
         expired = [k for k, ts in _PROCESSED_MSG_IDS.items() if now_ts - ts > 300]
@@ -1339,22 +1531,17 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
             return
         _PROCESSED_MSG_IDS[msg_id] = now_ts
 
-    chat_id = str(msg.get("chatId") or "").strip()
-    channel_id = str(msg.get("channelId") or WAZZUP_CHANNEL_ID).strip()
+    chat_id, channel_id, text, content_uri, tg_username, contact_name, contact_phone = _extract_incoming_fields(msg)
     if not chat_id:
         return
 
-    text = (msg.get("text") or "").strip()
-    content_uri = (msg.get("contentUri") or "").strip()
-    contact_info = msg.get("contact") or {}
-    tg_username = (contact_info.get("username") or "").strip()
-    contact_name = (contact_info.get("name") or "Пользователь").strip()
-    contact_phone = (contact_info.get("phone") or "").strip()
-
+    logger.info("Входящее сообщение Wazzup: chatId=%s chatType=%s text=%r", chat_id, chat_type or "unknown", text)
     save_user_session(chat_id, phone=contact_phone, username=tg_username, full_name=contact_name)
 
+    norm_cmd = normalize_choice_text(text)
+
     # Глобальные команды и кнопки навигации
-    if text == "/start" or text == "⬅️ В начало":
+    if text == "/start" or norm_cmd in ("в начало", "главное меню", "старт", "start"):
         clear_user_state(chat_id)
         greeting = (
             f"Привет, {contact_name}! 👋\n\n"
@@ -1364,22 +1551,27 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         await wazzup_send_text(chat_id, greeting, buttons=kb_start_menu(), channel_id=channel_id)
         return
 
-    if text == "❌ Отмена":
+    if norm_cmd in ("отмена", "отменить", "cancel"):
         clear_user_state(chat_id)
         await wazzup_send_text(chat_id, "Отменено.", buttons=kb_start_menu(), channel_id=channel_id)
         return
 
-    if text == "🚀 Подключиться к парку":
+    if norm_cmd in ("подключиться к парку", "подключиться", "регистрация", "стать курьером"):
         set_user_state(chat_id, "reg_transport", {"mode": "courier", "return_to_confirm": False})
         await wazzup_send_text(
             chat_id,
-            "Шаг 1 из 4. Как планируете доставлять заказы?",
+            "Шаг 1 из 4. Как планируете доставлять заказы?\n\n"
+            "Напишите или выберите вариант:\n"
+            "1. Пеший / Вело\n"
+            "2. Мото\n"
+            "3. Авто\n"
+            "4. Грузовой",
             buttons=kb_transport_choice(),
             channel_id=channel_id,
         )
         return
 
-    if text == "✅ Уже курьер парка":
+    if norm_cmd in ("уже курьер парка", "уже курьер", "кабинет", "мой кабинет"):
         set_user_state(chat_id, "courier_auth_phone", {})
         await wazzup_send_text(
             chat_id,
@@ -1389,7 +1581,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         )
         return
 
-    if text == "🔄 Сменить номер":
+    if norm_cmd in ("сменить номер", "изменить номер аккаунта"):
         set_user_state(chat_id, "courier_auth_phone", {})
         await wazzup_send_text(
             chat_id,
@@ -1399,7 +1591,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         )
         return
 
-    if text == "❓ Нужна помощь":
+    if norm_cmd in ("нужна помощь", "помощь", "поддержка", "оператор"):
         set_user_state(chat_id, "help_waiting_problem", {})
         await wazzup_send_text(
             chat_id,
@@ -1409,13 +1601,13 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         )
         return
 
-    if text == "📊 Моя статистика":
+    if norm_cmd in ("моя статистика", "статистика"):
         driver = await get_saved_profile_or_redirect(chat_id, channel_id)
         if driver:
             await show_cabinet_for_profile(chat_id, channel_id, driver)
         return
 
-    if text == "🤔 Я на линии?":
+    if norm_cmd in ("я на линии?", "я на линии", "статус линии", "линия"):
         driver = await get_saved_profile_or_redirect(chat_id, channel_id)
         if not driver:
             return
@@ -1446,7 +1638,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         await wazzup_send_text(chat_id, resp_text, buttons=kb_courier_cabinet(), channel_id=channel_id)
         return
 
-    if text == "🎁 Цель":
+    if norm_cmd in ("цель", "бонус", "моя цель"):
         driver = await get_saved_profile_or_redirect(chat_id, channel_id)
         if not driver:
             return
@@ -1501,7 +1693,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         return
 
     if step == "courier_pick_profile":
-        if text == "Хочу ввести другой номер":
+        if norm_cmd == "хочу ввести другой номер":
             set_user_state(chat_id, "courier_auth_phone", {})
             await wazzup_send_text(
                 chat_id,
@@ -1511,11 +1703,11 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
             )
             return
         profiles = PENDING_PROFILES.get(chat_id, [])
-        m = re.match(r"^(\d+)\.", text)
+        m = re.match(r"^(\d+)", text.strip())
         if not m or int(m.group(1)) < 1 or int(m.group(1)) > len(profiles):
             await wazzup_send_text(
                 chat_id,
-                "Выберите профиль кнопкой из списка ниже:",
+                "Выберите профиль кнопкой или напишите его номер из списка:",
                 buttons=kb_profiles_choice(profiles) if profiles else kb_start_menu(),
                 channel_id=channel_id,
             )
@@ -1558,12 +1750,22 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         return
 
     if step == "reg_transport":
-        if not text:
-            await wazzup_send_text(chat_id, "Выберите формат доставки:", buttons=kb_transport_choice(), channel_id=channel_id)
+        chosen_transport = parse_transport_choice(text)
+        if not chosen_transport:
+            await wazzup_send_text(
+                chat_id,
+                "Выберите формат доставки (напишите или нажмите вариант):\n"
+                "1. Пеший / Вело\n"
+                "2. Мото\n"
+                "3. Авто\n"
+                "4. Грузовой",
+                buttons=kb_transport_choice(),
+                channel_id=channel_id,
+            )
             return
-        data = update_user_state_data(chat_id, transport=text)
+        data = update_user_state_data(chat_id, transport=chosen_transport)
         if data.get("return_to_confirm"):
-            if requires_two_sided_sts(text) and not (data.get("sts_front_url") and data.get("sts_back_url")):
+            if requires_two_sided_sts(chosen_transport) and not (data.get("sts_front_url") and data.get("sts_back_url")):
                 set_user_state(chat_id, "reg_sts_front", data)
                 await wazzup_send_text(
                     chat_id,
@@ -1678,7 +1880,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         return
 
     if step == "reg_confirm":
-        if text == "Исправить":
+        if norm_cmd in ("исправить", "изменить", "редактировать"):
             data = update_user_state_data(chat_id, return_to_confirm=True)
             set_user_state(chat_id, "reg_choosing_edit", data)
             await wazzup_send_text(
@@ -1688,7 +1890,7 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
                 channel_id=channel_id,
             )
             return
-        if text == "Да":
+        if norm_cmd in ("да", "верно", "подтверждаю", "ок", "yes"):
             await finalize_registration(chat_id, channel_id, data, tg_username)
             return
         await wazzup_send_text(
@@ -1700,26 +1902,35 @@ async def handle_incoming_wazzup_message(msg: dict[str, Any]) -> None:
         return
 
     if step == "reg_choosing_edit":
-        if text == "Назад к проверке":
+        if norm_cmd in ("назад к проверке", "назад"):
             await show_confirmation_screen(chat_id, channel_id, data)
             return
-        if text == "Изменить формат":
+        if norm_cmd in ("изменить формат", "формат", "транспорт"):
             set_user_state(chat_id, "reg_transport", data)
-            await wazzup_send_text(chat_id, "Выберите новый формат доставки:", buttons=kb_transport_choice(), channel_id=channel_id)
+            await wazzup_send_text(
+                chat_id,
+                "Выберите новый формат доставки:\n"
+                "1. Пеший / Вело\n"
+                "2. Мото\n"
+                "3. Авто\n"
+                "4. Грузовой",
+                buttons=kb_transport_choice(),
+                channel_id=channel_id,
+            )
             return
-        if text == "Изменить город":
+        if norm_cmd in ("изменить город", "город"):
             set_user_state(chat_id, "reg_city", data)
             await wazzup_send_text(chat_id, "Введите новый город:", buttons=kb_cancel_only(), channel_id=channel_id)
             return
-        if text == "Изменить имя":
+        if norm_cmd in ("изменить имя", "имя"):
             set_user_state(chat_id, "reg_name", data)
             await wazzup_send_text(chat_id, "Введите новые Фамилию и Имя:", buttons=kb_cancel_only(), channel_id=channel_id)
             return
-        if text == "Изменить телефон":
+        if norm_cmd in ("изменить телефон", "телефон"):
             set_user_state(chat_id, "reg_phone", data)
             await wazzup_send_text(chat_id, "Отправьте новый номер телефона:", buttons=kb_cancel_only(), channel_id=channel_id)
             return
-        if text == "Изменить фото СТС":
+        if norm_cmd in ("изменить фото стс", "фото стс", "стс"):
             set_user_state(chat_id, "reg_sts_front", data)
             await wazzup_send_text(
                 chat_id,
@@ -1753,10 +1964,14 @@ async def handle_wazzup_webhook(request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
 
     if isinstance(payload, dict):
-        messages = payload.get("messages") or []
-        for msg in messages:
-            if isinstance(msg, dict):
-                asyncio.create_task(handle_incoming_wazzup_message(msg))
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            for msg in messages:
+                if isinstance(msg, dict):
+                    asyncio.create_task(handle_incoming_wazzup_message(msg))
+        # Поддержка одиночного сообщения в корне payload на случай разных форматов вебхука
+        if isinstance(payload.get("chatId"), (str, int)) and not messages:
+            asyncio.create_task(handle_incoming_wazzup_message(payload))
 
     return web.json_response({"status": "ok"})
 
