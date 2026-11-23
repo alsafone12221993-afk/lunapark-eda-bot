@@ -22,7 +22,7 @@ from aiogram.types import (
 )
 
 # ================= КОНФИГУРАЦИЯ =================
-BOT_TOKEN = "9247740629:AAElpuX1NSdAE0pWwT-SutE56rS0SZHMiek"
+BOT_TOKEN = "9247740629:AAHjKLh1e7cWIznoDS4ogpxfIENiIyx9FvI"
 ADMIN_IDS: set[int] = {673430213}
 
 ADMIN_FILE = "admin_chat.json"
