@@ -7,6 +7,7 @@ import os
 import random
 import re
 import time
+import urllib.parse
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -30,6 +31,10 @@ WAZZUP_WEBHOOK_AUTHORIZATION = os.getenv(
 ).strip()
 WAZZUP_ENABLED = os.getenv("WAZZUP_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 WAZZUP_API_URL = "https://api.wazzup24.com/v3/message"
+# Публичный адрес бота (например https://my-bot.bothost.ru). При старте бот сам
+# пропишет в Wazzup адрес вебхука вида <адрес>/webhook/wazzup?secret=<секрет>.
+WAZZUP_PUBLIC_URL = os.getenv("WAZZUP_PUBLIC_URL", "").strip().rstrip("/")
+WAZZUP_WEBHOOKS_API_URL = "https://api.wazzup24.com/v3/webhooks"
 AMOCRM_WEBHOOK_SECRET = os.getenv("AMOCRM_WEBHOOK_SECRET", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -4568,6 +4573,49 @@ async def handle_tg_webhook(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def wazzup_register_webhook() -> None:
+    """Прописывает в Wazzup адрес вебхука с секретом в query string."""
+    # Даём aiohttp время начать принимать запросы: Wazzup может сразу
+    # отправить на новый адрес тестовый POST.
+    await asyncio.sleep(5)
+
+    if not WAZZUP_PUBLIC_URL:
+        logger.warning("WAZZUP_PUBLIC_URL не задан: адрес вебхука в Wazzup не обновляется")
+        return
+    secret = WAZZUP_WEBHOOK_AUTHORIZATION or WAZZUP_WEBHOOK_SECRET
+    if not secret:
+        logger.warning("Не задан WAZZUP_WEBHOOK_SECRET/WAZZUP_WEBHOOK_AUTHORIZATION: вебхук не обновляется")
+        return
+
+    base = WAZZUP_PUBLIC_URL
+    if not base.endswith("/webhook/wazzup"):
+        base += "/webhook/wazzup"
+    webhooks_uri = f"{base}?secret={urllib.parse.quote(secret, safe='')}"
+    if len(webhooks_uri) > 200:
+        logger.error("Адрес вебхука длиннее 200 символов, Wazzup его не примет")
+        return
+
+    headers = {
+        "Authorization": f"Bearer {WAZZUP_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "webhooksUri": webhooks_uri,
+        "subscriptions": {"messagesAndStatuses": True},
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.patch(WAZZUP_WEBHOOKS_API_URL, json=body, headers=headers) as resp:
+                text = await resp.text()
+                if resp.status == 200:
+                    logger.info("Wazzup: адрес вебхука обновлён (%s%s)", base, "?secret=***")
+                else:
+                    logger.error("Wazzup: не удалось обновить вебхук, status=%s body=%s", resp.status, text[:300])
+    except Exception:
+        logger.exception("Wazzup: ошибка при обновлении адреса вебхука")
+
+
 async def on_startup(app: web.Application) -> None:
     app["delayed_worker"] = asyncio.create_task(delayed_notifications_worker())
     app["ephemeral_worker"] = asyncio.create_task(ephemeral_cleaner_worker())
@@ -4576,6 +4624,7 @@ async def on_startup(app: web.Application) -> None:
         if not WAZZUP_API_KEY or not WAZZUP_CHANNEL_ID:
             raise RuntimeError("WAZZUP_ENABLED=1, но не заданы WAZZUP_API_KEY и/или WAZZUP_CHANNEL_ID")
         logger.warning("Режим WAZZUP включён: Telegram polling и Telegram webhook НЕ запускаются")
+        app["wazzup_webhook_task"] = asyncio.create_task(wazzup_register_webhook())
         return
     if not TELEGRAM_BOT_TOKEN:
         logger.error("Не задан TELEGRAM_BOT_TOKEN. Для старого режима укажите его в переменных окружения.")
@@ -4593,7 +4642,7 @@ async def on_startup(app: web.Application) -> None:
 
 
 async def on_cleanup(app: web.Application) -> None:
-    for task_key in ("polling_task", "delayed_worker", "ephemeral_worker", "demand_worker"):
+    for task_key in ("polling_task", "delayed_worker", "ephemeral_worker", "demand_worker", "wazzup_webhook_task"):
         task = app.get(task_key)
         if task:
             task.cancel()
