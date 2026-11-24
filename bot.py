@@ -16,9 +16,15 @@ import aiohttp
 from aiohttp import web
 
 # ================= КОНФИГУРАЦИЯ =================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9247740629:AAGDDIXtFOfRj66kiX7gDReNZ1IdnxudOT4").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+# Wazzup is the ONLY Telegram transport when enabled. Do not run Telegram getUpdates in parallel.
+WAZZUP_API_KEY = os.getenv("WAZZUP_API_KEY", "").strip()
+WAZZUP_CHANNEL_ID = os.getenv("WAZZUP_CHANNEL_ID", "").strip()
+WAZZUP_WEBHOOK_SECRET = os.getenv("WAZZUP_WEBHOOK_SECRET", "").strip()
+WAZZUP_ENABLED = os.getenv("WAZZUP_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+WAZZUP_API_URL = "https://api.wazzup24.com/v3/message"
 AMOCRM_WEBHOOK_SECRET = os.getenv("AMOCRM_WEBHOOK_SECRET", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -49,15 +55,12 @@ PARKS_CONFIG: list[dict[str, str]] = [
         "name": "ЛунапаркЕда",
         "park_id": os.getenv("YANDEX_PARK_ID", "1680a13d35084b0688ecab0f925c9d75"),
         "client_id": os.getenv("YANDEX_CLIENT_ID", "taxi/park/1680a13d35084b0688ecab0f925c9d75"),
-        "api_key": os.getenv("YANDEX_API_KEY", "yapi10-E5IuB_Gpfog2E7XMXYxTl1SsS3HyVGbXduM9Jg_d1"),
+        "api_key": os.getenv("YANDEX_API_KEY", ""),
     },
 ]
 
 AMOCRM_BASE_URL = os.getenv("AMOCRM_BASE_URL", "https://lunapark7042.amocrm.ru").strip()
-AMOCRM_ACCESS_TOKEN = os.getenv(
-    "AMOCRM_ACCESS_TOKEN",
-    "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImp0aSI6ImQ3NDM4MThmM2IxMzMxYTE2ZDUwZDRhMDA5ZWI3ZmQ1OTI3YTQ5YTljMDE4OWMwZGY5NjY2YTM2OTU4YjdiYjA1ZjhkNmM2MjkyZDY3MjM2In0.eyJhdWQiOiI3NjNkNmJjNC1mMGVmLTQwY2EtYjg3Mi01MmMzMmY5MWM5MTQiLCJqdGkiOiJkNzQzODE4ZjNiMTMzMWExNmQ1MGQ0YTAwOWViN2ZkNTkyN2E0OWE5YzAxODljMGRmOTY2NmEzNjk1OGI3YmIwNWY4ZDZjNjI5MmQ2NzIzNiIsImlhdCI6MTc5NTMzMDQyNiwibmJmIjoxNzk1MzMwNDI2LCJleHAiOjE5NDc2Mjg4MDAsInN1YiI6IjEyNjQ1NDY2IiwiZ3JhbnRfdHlwZSI6IiIsImFjY291bnRfaWQiOjMxMjkwOTc0LCJiYXNlX2RvbWFpbiI6ImFtb2NybS5ydSIsInZlcnNpb24iOjIsInNjb3BlcyI6WyJwdXNoX25vdGlmaWNhdGlvbnMiLCJmaWxlcyIsImNybSIsImZpbGVzX2RlbGV0ZSIsIm5vdGlmaWNhdGlvbnMiXSwiaGFzaF91dWlkIjoiMDFjMWE3MWEtZWI5Yy00MjJjLTg4ODEtMGQ2Mjg3ZDA2ODA2IiwiYXBpX2RvbWFpbiI6ImFwaS1iLmFtb2NybS5ydSJ9.TyjWbPrNmzDY_yUNQwEFO-8kWSW0MNHyoF_Xd5Vir0TRTfhpLGcpUOAKKPRvLvpESIO1wJ-lUXMcmawGdiLFbKLTqQv3djdWUc2vypbZZVsHKXT2_ZHhaLyxYHNtWB-HJ1Z_F8TB404KqnjlQ2n6opAlu5HMdHpamquMn3AJUcZAqMTknQ8_mlaiMQRUvhD1Dvn6XRtJ9SETH3a78QUQbpj__qc-HOT_b91eLHgjUIV6uLVqRyMFioPjrpY0jpZnAk4CLRoClNZPqml5qbcSnFfJuLBD763O5JoprazMnIWIR_r80Nc7DpLLZk3Eb_yXKTiRqj67lskDtvoM6q19zQ",
-).strip()
+AMOCRM_ACCESS_TOKEN = os.getenv("AMOCRM_ACCESS_TOKEN", "").strip()
 AMOCRM_PIPELINE_ID = int(os.getenv("AMOCRM_PIPELINE_ID", "10053610"))
 AMOCRM_STATUS_ID = int(os.getenv("AMOCRM_STATUS_ID", "79731826"))
 AMOCRM_CLOSED_LOST_ID = int(os.getenv("AMOCRM_CLOSED_LOST_ID", "143"))
@@ -1119,19 +1122,88 @@ async def tg_api(session: aiohttp.ClientSession, method: str, payload: dict[str,
         return data
 
 
+async def wazzup_send_message(
+    chat_id: int | str,
+    text: str = "",
+    content_uri: str | None = None,
+    reply_markup: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not WAZZUP_API_KEY or not WAZZUP_CHANNEL_ID:
+        logger.error("Wazzup включён, но не заданы WAZZUP_API_KEY или WAZZUP_CHANNEL_ID")
+        return {"ok": False, "error": "missing_wazzup_config"}
+    payload: dict[str, Any] = {
+        "channelId": WAZZUP_CHANNEL_ID,
+        "chatType": "telegram",
+        "chatId": str(chat_id),
+    }
+    if text:
+        payload["text"] = text
+    if content_uri:
+        payload["contentUri"] = content_uri
+    # Wazzup supports Telegram keyboard buttons via buttonsObject.
+    if reply_markup:
+        keyboard = reply_markup.get("inline_keyboard")
+        if isinstance(keyboard, list):
+            buttons = []
+            for row in keyboard:
+                for btn in row if isinstance(row, list) else []:
+                    if not isinstance(btn, dict):
+                        continue
+                    item = {"text": str(btn.get("text") or "Кнопка")}
+                    if btn.get("callback_data") is not None:
+                        item["callbackData"] = str(btn["callback_data"])[:64]
+                    elif btn.get("url"):
+                        item["url"] = str(btn["url"])
+                    else:
+                        continue
+                    buttons.append(item)
+            if buttons:
+                payload["buttonsObject"] = {"buttons": buttons, "replyMarkup": "inline"}
+        elif isinstance(reply_markup.get("keyboard"), list):
+            buttons = []
+            for row in reply_markup["keyboard"]:
+                for btn in row if isinstance(row, list) else []:
+                    label = btn.get("text") if isinstance(btn, dict) else btn
+                    if label:
+                        buttons.append({"text": str(label)})
+            if buttons:
+                payload["buttonsObject"] = {"buttons": buttons, "replyMarkup": "keyboard"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                WAZZUP_API_URL,
+                json=payload,
+                headers={"Authorization": f"Bearer {WAZZUP_API_KEY}", "Content-Type": "application/json"},
+                timeout=30,
+            ) as resp:
+                raw = await resp.text()
+                try:
+                    data = json.loads(raw) if raw else {}
+                except Exception:
+                    data = {"raw": raw[:500]}
+                if resp.status >= 300:
+                    logger.error("Wazzup send failed: HTTP %s: %s", resp.status, raw[:500])
+                    return {"ok": False, "status": resp.status, "data": data}
+                return {"ok": True, "data": data}
+    except Exception as exc:
+        logger.exception("Ошибка отправки через Wazzup: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+
 async def tg_send_text(
     chat_id: int | str,
     text: str,
     reply_markup: dict[str, Any] | None = None,
     parse_mode: str | None = None,
 ) -> int | None:
+    if WAZZUP_ENABLED:
+        # Telegram HTML/Markdown parse_mode is not passed through blindly to Wazzup.
+        res = await wazzup_send_message(chat_id, text=text, reply_markup=reply_markup)
+        return 1 if res.get("ok") else None
     if not TELEGRAM_BOT_TOKEN:
         logger.error("Не задан TELEGRAM_BOT_TOKEN")
         return None
-    payload: dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": text,
-    }
+    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     if parse_mode:
@@ -1141,8 +1213,7 @@ async def tg_send_text(
             res = await tg_api(session, "sendMessage", payload)
             if not res.get("ok"):
                 return None
-            msg = res.get("result") or {}
-            mid = msg.get("message_id")
+            mid = (res.get("result") or {}).get("message_id")
             return int(mid) if isinstance(mid, int) else None
     except Exception as exc:
         logger.exception("Ошибка отправки сообщения в Telegram: %s", exc)
@@ -1150,6 +1221,8 @@ async def tg_send_text(
 
 
 async def tg_delete_message(chat_id: int | str, message_id: int) -> bool:
+    if WAZZUP_ENABLED:
+        return False  # Wazzup transport does not expose Telegram deleteMessage here.
     if not TELEGRAM_BOT_TOKEN or not message_id:
         return False
     try:
@@ -1227,12 +1300,18 @@ async def tg_send_photo(
     file_id: str,
     caption: str = "",
 ) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not file_id:
+    if not file_id:
         return False
-    payload: dict[str, Any] = {
-        "chat_id": chat_id,
-        "photo": file_id,
-    }
+    if WAZZUP_ENABLED:
+        # For Wazzup media must be a publicly reachable URL (contentUri).
+        if not str(file_id).startswith(("https://", "http://")):
+            logger.error("Нельзя отправить Telegram file_id через Wazzup: требуется публичный URL вложения")
+            return False
+        res = await wazzup_send_message(chat_id, text=caption, content_uri=str(file_id))
+        return bool(res.get("ok"))
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    payload: dict[str, Any] = {"chat_id": chat_id, "photo": file_id}
     if caption:
         payload["caption"] = caption
     try:
@@ -1245,10 +1324,20 @@ async def tg_send_photo(
 
 
 async def tg_download_file(file_id: str, default_name: str) -> Optional[tuple[bytes, str]]:
-    if not TELEGRAM_BOT_TOKEN or not file_id:
+    if not file_id:
         return None
     try:
         async with aiohttp.ClientSession() as session:
+            if str(file_id).startswith(("https://", "http://")):
+                async with session.get(str(file_id), timeout=30, allow_redirects=True) as resp:
+                    if resp.status != 200:
+                        return None
+                    raw = await resp.read()
+                    ctype = resp.headers.get("Content-Type", "")
+                    ext = os.path.splitext(default_name)[1] or (".png" if "png" in ctype else ".jpg")
+                    return raw, os.path.splitext(default_name)[0] + ext
+            if not TELEGRAM_BOT_TOKEN:
+                return None
             info = await tg_api(session, "getFile", {"file_id": file_id})
             file_path = (info.get("result") or {}).get("file_path")
             if not file_path:
@@ -3184,6 +3273,11 @@ def _extract_photo_file_id(message: dict[str, Any]) -> str:
     doc = message.get("document")
     if isinstance(doc, dict):
         return str(doc.get("file_id") or "")
+    attachment = message.get("attachment") or message.get("attachments")
+    if isinstance(attachment, list) and attachment:
+        attachment = attachment[0]
+    if isinstance(attachment, dict):
+        return str(attachment.get("contentUri") or attachment.get("url") or attachment.get("download_url") or "")
     return ""
 
 
@@ -4248,6 +4342,84 @@ async def handle_amocrm_webhook(request: web.Request) -> web.Response:
     return web.json_response({"ok": bool(sent_mid), "sent_to": target_tg_id})
 
 
+_WAZZUP_SEEN_MESSAGES: dict[str, float] = {}
+
+
+def _wazzup_to_telegram_update(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert Wazzup message.add payload into the existing bot's update shape."""
+    msg = payload.get("message") if isinstance(payload.get("message"), dict) else payload
+    direction = str(msg.get("direction") or payload.get("direction") or "").lower()
+    if direction and direction not in ("in", "incoming", "inbound"):
+        return None
+    recipient = msg.get("recipient") if isinstance(msg.get("recipient"), dict) else (payload.get("recipient") or {})
+    sender = msg.get("sender") if isinstance(msg.get("sender"), dict) else (payload.get("sender") or {})
+    chat_id = (recipient.get("chat_id") or recipient.get("chatId") or msg.get("chat_id") or msg.get("chatId")
+               or payload.get("chat_id") or payload.get("chatId"))
+    if not chat_id:
+        # Some webhook variants put the Telegram peer id on sender for inbound messages.
+        chat_id = sender.get("chat_id") or sender.get("chatId") or sender.get("id")
+    if not chat_id:
+        logger.warning("Wazzup webhook: не найден Telegram chat_id: %s", str(payload)[:700])
+        return None
+    chat_id = str(chat_id)
+    username = sender.get("username") or recipient.get("username") or ""
+    first_name = sender.get("name") or sender.get("first_name") or recipient.get("name") or "друг"
+    last_name = sender.get("last_name") or recipient.get("last_name") or ""
+    text_value = msg.get("text") or payload.get("text") or ""
+    message: dict[str, Any] = {
+        "message_id": msg.get("message_id") or msg.get("id") or int(time.time()),
+        "date": int(time.time()),
+        "chat": {"id": chat_id, "type": "private", "first_name": str(first_name), "last_name": str(last_name)},
+        "from": {"id": chat_id, "is_bot": False, "first_name": str(first_name), "last_name": str(last_name), "username": str(username)},
+        "text": str(text_value),
+    }
+    attachment = msg.get("attachment") or payload.get("attachment") or msg.get("attachments") or payload.get("attachments")
+    if isinstance(attachment, list) and attachment:
+        attachment = attachment[0]
+    if isinstance(attachment, dict):
+        url = attachment.get("contentUri") or attachment.get("url") or attachment.get("download_url")
+        kind = str(attachment.get("type") or attachment.get("mime_type") or attachment.get("content_type") or "").lower()
+        if url:
+            file_obj = {"file_id": str(url), "file_unique_id": str(msg.get("message_id") or msg.get("id") or "wz-file")}
+            if "image" in kind or str(url).lower().split("?")[0].endswith((".jpg", ".jpeg", ".png", ".webp")):
+                message["photo"] = [file_obj]
+            else:
+                file_obj["file_name"] = attachment.get("file_name") or attachment.get("name") or "attachment"
+                message["document"] = file_obj
+    return {"update_id": int(time.time() * 1000), "message": message}
+
+
+async def handle_wazzup_webhook(request: web.Request) -> web.Response:
+    if WAZZUP_WEBHOOK_SECRET:
+        supplied = request.query.get("secret") or request.headers.get("X-Wazzup-Secret", "")
+        if not hmac.compare_digest(supplied, WAZZUP_WEBHOOK_SECRET):
+            return web.json_response({"ok": False}, status=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"ok": True, "ignored": "not_object"})
+    event = str(payload.get("event") or payload.get("type") or "message.add").lower()
+    if event not in ("message.add", "message_add", "message"):
+        return web.json_response({"ok": True, "ignored": event})
+    msg = payload.get("message") if isinstance(payload.get("message"), dict) else payload
+    message_id = str(msg.get("message_id") or msg.get("id") or payload.get("message_id") or payload.get("id") or "")
+    now = time.time()
+    # Wazzup may retry webhooks; prevent duplicate processing.
+    for key, stamp in list(_WAZZUP_SEEN_MESSAGES.items()):
+        if now - stamp > 86400:
+            _WAZZUP_SEEN_MESSAGES.pop(key, None)
+    if message_id and message_id in _WAZZUP_SEEN_MESSAGES:
+        return web.json_response({"ok": True, "duplicate": True})
+    update = _wazzup_to_telegram_update(payload)
+    if update:
+        if message_id:
+            _WAZZUP_SEEN_MESSAGES[message_id] = now
+        asyncio.create_task(handle_telegram_update(update))
+    return web.json_response({"ok": True, "accepted": bool(update)})
+
+
 async def polling_loop() -> None:
     logger.info("Запуск Telegram polling")
     offset: int | None = None
@@ -4300,10 +4472,14 @@ async def on_startup(app: web.Application) -> None:
     app["delayed_worker"] = asyncio.create_task(delayed_notifications_worker())
     app["ephemeral_worker"] = asyncio.create_task(ephemeral_cleaner_worker())
     app["demand_worker"] = asyncio.create_task(demand_monitor_worker())
-    if not TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN пуст! Укажите токен бота от @BotFather.")
+    if WAZZUP_ENABLED:
+        if not WAZZUP_API_KEY or not WAZZUP_CHANNEL_ID:
+            raise RuntimeError("WAZZUP_ENABLED=1, но не заданы WAZZUP_API_KEY и/или WAZZUP_CHANNEL_ID")
+        logger.warning("Режим WAZZUP включён: Telegram polling и Telegram webhook НЕ запускаются")
         return
-
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("Не задан TELEGRAM_BOT_TOKEN. Для старого режима укажите его в переменных окружения.")
+        return
     async with aiohttp.ClientSession() as session:
         if TELEGRAM_WEBHOOK_URL:
             wh_payload: dict[str, Any] = {"url": TELEGRAM_WEBHOOK_URL}
@@ -4333,6 +4509,7 @@ def create_app() -> web.Application:
     app.router.add_get("/health", handle_health)
     app.router.add_post("/", handle_amocrm_webhook)
     app.router.add_post("/webhook/telegram", handle_tg_webhook)
+    app.router.add_post("/webhook/wazzup", handle_wazzup_webhook)
     app.router.add_post("/webhook/amocrm", handle_amocrm_webhook)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
