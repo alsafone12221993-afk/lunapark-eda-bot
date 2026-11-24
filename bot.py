@@ -23,6 +23,11 @@ TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 WAZZUP_API_KEY = os.getenv("WAZZUP_API_KEY", "").strip()
 WAZZUP_CHANNEL_ID = os.getenv("WAZZUP_CHANNEL_ID", "").strip()
 WAZZUP_WEBHOOK_SECRET = os.getenv("WAZZUP_WEBHOOK_SECRET", "").strip()
+# Exact value configured in Wazzup webhook subscription as authorization_header.
+# If not set, the existing WAZZUP_WEBHOOK_SECRET is used for Authorization too.
+WAZZUP_WEBHOOK_AUTHORIZATION = os.getenv(
+    "WAZZUP_WEBHOOK_AUTHORIZATION", WAZZUP_WEBHOOK_SECRET
+).strip()
 WAZZUP_ENABLED = os.getenv("WAZZUP_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 WAZZUP_API_URL = "https://api.wazzup24.com/v3/message"
 AMOCRM_WEBHOOK_SECRET = os.getenv("AMOCRM_WEBHOOK_SECRET", "").strip()
@@ -4396,9 +4401,32 @@ def _wazzup_to_telegram_update(payload: dict[str, Any]) -> dict[str, Any] | None
 
 
 async def handle_wazzup_webhook(request: web.Request) -> web.Response:
-    if WAZZUP_WEBHOOK_SECRET:
-        supplied = request.query.get("secret") or request.headers.get("X-Wazzup-Secret", "")
-        if not hmac.compare_digest(supplied, WAZZUP_WEBHOOK_SECRET):
+    # Wazzup sends the value configured in webhook subscription's
+    # authorization_header as the HTTP Authorization header.
+    # Keep support for the previous query/header scheme during migration.
+    expected = WAZZUP_WEBHOOK_AUTHORIZATION or WAZZUP_WEBHOOK_SECRET
+    if expected:
+        authorization = request.headers.get("Authorization", "").strip()
+        legacy_supplied = (
+            request.query.get("secret")
+            or request.headers.get("X-Wazzup-Secret", "")
+        ).strip()
+
+        valid_authorization = (
+            hmac.compare_digest(authorization, expected)
+            or hmac.compare_digest(authorization, f"Bearer {expected}")
+        )
+        valid_legacy = bool(legacy_supplied) and hmac.compare_digest(
+            legacy_supplied, expected
+        )
+
+        if not (valid_authorization or valid_legacy):
+            logger.warning(
+                "Wazzup webhook: отклонён запрос без корректной авторизации "
+                "(Authorization present=%s, legacy present=%s)",
+                bool(authorization),
+                bool(legacy_supplied),
+            )
             return web.json_response({"ok": False}, status=403)
 
     try:
