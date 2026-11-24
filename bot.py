@@ -352,6 +352,7 @@ PENDING_PROFILES: dict[str, list[dict[str, Any]]] = {}
 _FILE_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 _STATS_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 _FLOOD_TIMESTAMPS: dict[str, list[float]] = defaultdict(list)
+WAZZUP_SEEN_MESSAGE_IDS: set[str] = set()
 
 VEHICLE_DOCS_KEYWORDS = ("авто", "мото", "груз")
 
