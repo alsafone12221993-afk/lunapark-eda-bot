@@ -1196,10 +1196,9 @@ async def tg_send_text(
     reply_markup: dict[str, Any] | None = None,
     parse_mode: str | None = None,
 ) -> int | None:
-    if WAZZUP_ENABLED:
-        # Telegram HTML/Markdown parse_mode is not passed through blindly to Wazzup.
-        res = await wazzup_send_message(chat_id, text=text, reply_markup=reply_markup)
-        return 1 if res.get("ok") else None
+    # Bot menus and automated replies must go directly through Telegram Bot API.
+    # Wazzup is the operator inbox; routing every bot reply through Wazzup
+    # breaks Telegram reply-keyboards and fills the operator chat with bot menus.
     if not TELEGRAM_BOT_TOKEN:
         logger.error("Не задан TELEGRAM_BOT_TOKEN")
         return None
@@ -1221,8 +1220,6 @@ async def tg_send_text(
 
 
 async def tg_delete_message(chat_id: int | str, message_id: int) -> bool:
-    if WAZZUP_ENABLED:
-        return False  # Wazzup transport does not expose Telegram deleteMessage here.
     if not TELEGRAM_BOT_TOKEN or not message_id:
         return False
     try:
@@ -1302,13 +1299,7 @@ async def tg_send_photo(
 ) -> bool:
     if not file_id:
         return False
-    if WAZZUP_ENABLED:
-        # For Wazzup media must be a publicly reachable URL (contentUri).
-        if not str(file_id).startswith(("https://", "http://")):
-            logger.error("Нельзя отправить Telegram file_id через Wazzup: требуется публичный URL вложения")
-            return False
-        res = await wazzup_send_message(chat_id, text=caption, content_uri=str(file_id))
-        return bool(res.get("ok"))
+    # Photos sent by the bot remain Telegram messages; operator replies are handled by Wazzup.
     if not TELEGRAM_BOT_TOKEN:
         return False
     payload: dict[str, Any] = {"chat_id": chat_id, "photo": file_id}
