@@ -4399,36 +4399,129 @@ def _wazzup_to_telegram_update(payload: dict[str, Any]) -> dict[str, Any] | None
                 message["document"] = file_obj
 
     return {"update_id": int(time.time() * 1000), "message": message}
+    def _wazzup_get_channel_id(obj: dict[str, Any]) -> str:
+    """Достаёт channelId из разных вариантов структуры webhook Wazzup."""
+    if not isinstance(obj, dict):
+        return ""
+    for key in ("channelId", "channel_id"):
+        value = obj.get(key)
+        if isinstance(value, dict):
+            value = value.get("id") or value.get("channelId")
+        if value:
+            return str(value).strip()
+    channel = obj.get("channel")
+    if isinstance(channel, dict):
+        value = channel.get("id") or channel.get("channelId")
+        if value:
+            return str(value).strip()
+    message = obj.get("message")
+    if isinstance(message, dict):
+        nested = _wazzup_get_channel_id(message)
+        if nested:
+            return nested
+    meta = obj.get("meta")
+    if isinstance(meta, dict):
+        nested = _wazzup_get_channel_id(meta)
+        if nested:
+            return nested
+    return ""
 
 
 async def handle_wazzup_webhook(request: web.Request) -> web.Response:
-    # Wazzup sends the value configured in webhook subscription's
-    # authorization_header as the HTTP Authorization header.
-    # Keep support for the previous query/header scheme during migration.
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+    if not isinstance(payload, dict):
+        return web.json_response({"ok": True, "ignored": "not_object"})
+
+    event = str(payload.get("event") or payload.get("type") or "").lower()
+    if event not in ("message.add", "message_add", "message"):
+        return web.json_response({"ok": True, "ignored": event or "unknown_event"})
+
+    raw_items = payload.get("data")
+    if isinstance(raw_items, list):
+        items = [x for x in raw_items if isinstance(x, dict)]
+    elif isinstance(payload.get("message"), dict):
+        items = [payload["message"]]
+    else:
+        items = [payload]
+
     expected = WAZZUP_WEBHOOK_AUTHORIZATION or WAZZUP_WEBHOOK_SECRET
-    if expected:
-        authorization = request.headers.get("Authorization", "").strip()
-        legacy_supplied = (
-            request.query.get("secret")
-            or request.headers.get("X-Wazzup-Secret", "")
-        ).strip()
+    authorization = request.headers.get("Authorization", "").strip()
+    legacy_supplied = bool(expected) and bool(authorization) and hmac.compare_digest(
+        authorization, expected
+    )
 
-        valid_authorization = (
-            hmac.compare_digest(authorization, expected)
-            or hmac.compare_digest(authorization, f"Bearer {expected}")
+    if not legacy_supplied:
+        received_channels = [_wazzup_get_channel_id(it) for it in items]
+        channel_ok = bool(WAZZUP_CHANNEL_ID) and any(
+            cid == WAZZUP_CHANNEL_ID for cid in received_channels if cid
         )
-        valid_legacy = bool(legacy_supplied) and hmac.compare_digest(
-            legacy_supplied, expected
-        )
-
-        if not (valid_authorization or valid_legacy):
+        if not channel_ok:
             logger.warning(
-                "Wazzup webhook: отклонён запрос без корректной авторизации "
-                "(Authorization present=%s, legacy present=%s)",
+                "Wazzup webhook 403: expected_auth=%s got_auth=%s received_channels=%s payload_keys=%s",
+                bool(expected),
                 bool(authorization),
-                bool(legacy_supplied),
+                received_channels,
+                list(payload.keys()),
             )
-            return web.json_response({"ok": False}, status=403)
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=403)
+        logger.info("Wazzup webhook: запрос принят по совпадению channelId без Authorization")
+
+    accepted = 0
+    duplicates = 0
+    ignored = 0
+
+    for item in items:
+        chat_id = item.get("chatId") or item.get("chat_id")
+        if isinstance(chat_id, dict):
+            chat_id = chat_id.get("id") or chat_id.get("chatId")
+
+        message_id = item.get("messageId") or item.get("message_id") or item.get("id")
+
+        text = item.get("text")
+        if not text and isinstance(item.get("content"), dict):
+            text = item["content"].get("text")
+        if not text and isinstance(item.get("message"), dict):
+            text = item["message"].get("text")
+
+        direction = str(item.get("direction") or item.get("type") or "").lower()
+
+        if not chat_id or not text:
+            ignored += 1
+            continue
+        if direction in ("outgoing", "out", "sent", "from_me", "echo"):
+            ignored += 1
+            continue
+
+        if message_id:
+            dedup_key = f"{chat_id}:{message_id}"
+            if dedup_key in WAZZUP_SEEN_MESSAGE_IDS:
+                duplicates += 1
+                continue
+            WAZZUP_SEEN_MESSAGE_IDS.add(dedup_key)
+            if len(WAZZUP_SEEN_MESSAGE_IDS) > 5000:
+                WAZZUP_SEEN_MESSAGE_IDS.clear()
+
+        try:
+            await _dispatch_wazzup_text_message(str(chat_id), str(text), item)
+            accepted += 1
+        except Exception as exc:
+            logger.exception("Ошибка обработки Wazzup-сообщения: %s", exc)
+            ignored += 1
+
+    logger.info(
+        "Wazzup webhook: items=%s accepted=%s duplicates=%s ignored=%s",
+        len(items), accepted, duplicates, ignored,
+    )
+    return web.json_response({
+        "ok": True,
+        "accepted": accepted,
+        "duplicates": duplicates,
+        "ignored": ignored,
+    })
 
     try:
         payload = await request.json()
