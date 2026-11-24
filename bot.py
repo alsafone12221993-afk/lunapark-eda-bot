@@ -4351,6 +4351,52 @@ def _wazzup_to_telegram_update(payload: dict[str, Any]) -> dict[str, Any] | None
     """Convert one Wazzup message.add data item into the bot's update shape."""
     msg = payload.get("message") if isinstance(payload.get("message"), dict) else payload
 
+    # Формат Wazzup API v3: {"messages": [{messageId, channelId, chatType, chatId, ...}]}
+    if "messageId" in msg or ("chatId" in msg and "chatType" in msg):
+        if msg.get("isEcho") or msg.get("isDeleted"):
+            return None
+        if str(msg.get("status") or "inbound").lower() != "inbound":
+            return None
+        chat_type = str(msg.get("chatType") or "").lower()
+        if chat_type and chat_type != "telegram":
+            return None
+        v3_chat_id = str(msg.get("chatId") or "").strip()
+        if not v3_chat_id:
+            logger.warning("Wazzup message: пустой chatId; keys=%s", list(msg.keys()))
+            return None
+        if not v3_chat_id.lstrip("-").isdigit():
+            logger.warning(
+                "Wazzup message: chatId=%r не числовой — ответ через Telegram Bot API может не уйти",
+                v3_chat_id,
+            )
+
+        contact = msg.get("contact") if isinstance(msg.get("contact"), dict) else {}
+        v3_first_name = str(contact.get("name") or "друг")
+        v3_username = str(contact.get("username") or "")
+        v3_message_id = msg.get("messageId") or str(time.time_ns())
+
+        v3_message: dict[str, Any] = {
+            "message_id": v3_message_id,
+            "date": int(time.time()),
+            "chat": {"id": v3_chat_id, "type": "private", "first_name": v3_first_name, "last_name": ""},
+            "from": {
+                "id": v3_chat_id, "is_bot": False,
+                "first_name": v3_first_name, "last_name": "", "username": v3_username,
+            },
+            "text": str(msg.get("text") or ""),
+        }
+
+        content_uri = msg.get("contentUri")
+        if content_uri:
+            file_obj = {"file_id": str(content_uri), "file_unique_id": str(v3_message_id)}
+            if str(msg.get("type") or "").lower() == "image":
+                v3_message["photo"] = [file_obj]
+            else:
+                file_obj["file_name"] = "attachment"
+                v3_message["document"] = file_obj
+
+        return {"update_id": int(time.time() * 1000), "message": v3_message}
+
     direction = str(msg.get("direction") or payload.get("direction") or "").lower()
     if direction not in ("in", "incoming", "inbound"):
         return None
@@ -4470,19 +4516,27 @@ async def handle_wazzup_webhook(request: web.Request) -> web.Response:
     if not isinstance(payload, dict):
         return web.json_response({"ok": True, "ignored": "not_object"})
 
-    event = str(payload.get("event") or payload.get("type") or "").lower()
-    if event not in ("message.add", "message_add", "message"):
-        return web.json_response({"ok": True, "ignored": event or "unknown_event"})
-
-    # Current Wazzup webhook contract: payload.data is an array of messages.
-    # Older/alternate variants are accepted as a fallback.
-    raw_items = payload.get("data")
-    if isinstance(raw_items, list):
-        items = [item for item in raw_items if isinstance(item, dict)]
-    elif isinstance(payload.get("message"), dict):
-        items = [payload["message"]]
+    # Wazzup API v3: {"messages": [...]}, {"statuses": [...]}, {"test": true},
+    # {"channelsUpdates": [...]} — поля "event" в этом формате нет.
+    v3_messages = payload.get("messages")
+    if isinstance(v3_messages, list):
+        items = [item for item in v3_messages if isinstance(item, dict)]
     else:
-        items = [payload]
+        if payload.get("test"):
+            return web.json_response({"ok": True, "test": True})
+        event = str(payload.get("event") or payload.get("type") or "").lower()
+        if event not in ("message.add", "message_add", "message"):
+            logger.debug("Wazzup webhook: событие пропущено, keys=%s", list(payload.keys()))
+            return web.json_response({"ok": True, "ignored": event or "unknown_event"})
+
+        # Старый/альтернативный формат: payload.data — массив сообщений.
+        raw_items = payload.get("data")
+        if isinstance(raw_items, list):
+            items = [item for item in raw_items if isinstance(item, dict)]
+        elif isinstance(payload.get("message"), dict):
+            items = [payload["message"]]
+        else:
+            items = [payload]
 
     now = time.time()
     for cache in (_WAZZUP_SEEN_MESSAGES, _WAZZUP_SEEN_EVENTS):
@@ -4501,7 +4555,7 @@ async def handle_wazzup_webhook(request: web.Request) -> web.Response:
     duplicates = 0
     ignored = 0
     for item in items:
-        message_id = str(item.get("message_id") or item.get("id") or "")
+        message_id = str(item.get("messageId") or item.get("message_id") or item.get("id") or "")
         if message_id and message_id in _WAZZUP_SEEN_MESSAGES:
             duplicates += 1
             continue
