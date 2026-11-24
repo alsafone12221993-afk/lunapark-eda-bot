@@ -52,6 +52,8 @@ INITIAL_ADMIN_IDS: set[str] = {
 } | {SUPERADMIN_ID}
 
 OPERATOR_CHAT_ID = os.getenv("OPERATOR_CHAT_ID", SUPERADMIN_ID).strip()
+SUPPORT_TG_USERNAME = os.getenv("SUPPORT_TG_USERNAME", "LUNAPARK_DR").strip().lstrip("@")
+SUPPORT_TG_URL = f"https://t.me/{SUPPORT_TG_USERNAME}"
 
 DEMAND_RATE_RUB_PER_HOUR = int(os.getenv("DEMAND_RATE_RUB_PER_HOUR", "800"))
 
@@ -428,6 +430,14 @@ def _reply_kb(
     }
 
 
+def kb_support_inline() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": f"💬 Написать оператору @{SUPPORT_TG_USERNAME}", "url": SUPPORT_TG_URL}],
+        ]
+    }
+
+
 def kb_start_menu(is_admin: bool = False) -> dict[str, Any]:
     rows: list[list[str | dict[str, Any]]] = [
         ["🚀 Подключиться", "✅ Уже курьер"],
@@ -647,7 +657,7 @@ def _quick_faq_answer(text_low: str) -> str | None:
     if any(w in text_low for w in ("штраф", "корректиров", "списан", "удержан")):
         return (
             "⚖️ Корректировки и списания можно проверить в кабинете: нажми «✅ Уже курьер» -> «⚖️ Корректировки».\n"
-            "Если нужно разобраться по конкретной сумме — жми «❓ Помощь», подключим оператора."
+            f"Если нужно разобраться по конкретной сумме — жми «❓ Помощь» или пиши оператору @{SUPPORT_TG_USERNAME}."
         )
     if any(w in text_low for w in ("медкниж", "медицинск", "короб", "термокороб", "слот")):
         return (
@@ -657,7 +667,7 @@ def _quick_faq_answer(text_low: str) -> str | None:
     if any(w in text_low for w in ("выплат", "деньг", "баланс", "самозанят", "мой налог")):
         return (
             "💳 Баланс и статистика доступны в разделе «✅ Уже курьер» -> «📊 Моя статистика».\n"
-            "По вопросам выплат и самозанятости жми «❓ Помощь» — оператор подскажет."
+            f"По вопросам выплат и самозанятости пиши оператору @{SUPPORT_TG_USERNAME} или жми «❓ Помощь»."
         )
     return None
 
@@ -690,7 +700,7 @@ async def answer_simple_question_with_ai(user_text: str) -> str | None:
                                 "Ты помощник курьерского парка ЛунапаркЕда (Яндекс Еда / Яндекс Про). "
                                 "Отвечай кратко, по-дружески и по делу на русском (до 3-4 предложений). "
                                 "Не выдумывай точных цифр выплат или внутренних статусов — если нужен точный разбор, "
-                                "предложи нажать «Помощь» для связи с оператором."
+                                f"предложи написать оператору @{SUPPORT_TG_USERNAME} или нажать кнопку «Помощь»."
                             ),
                         },
                         {"role": "user", "content": user_text[:400]},
@@ -2071,7 +2081,6 @@ def _normalize_dist_value_to_km(raw_val: Any, unit_hint: str = "") -> float:
         return v / 1000.0
     if "km" in uh or "километр" in uh:
         return v
-    # Если число крупное (например 4200 метров), считаем что это метры
     if v >= 200:
         return v / 1000.0
     return v
@@ -3106,8 +3115,8 @@ async def lookup_and_route_phone(
         await tg_send_text(
             chat_id,
             "🔒 Этот номер уже привязан к другому Telegram-аккаунту.\n"
-            "Доступ к данным профиля запрещён в целях безопасности. Если ты сменил аккаунт — напиши в «❓ Помощь».",
-            reply_markup=kb_start_menu(is_admin=False),
+            f"Доступ к данным профиля запрещён в целях безопасности. Если ты сменил аккаунт — напиши оператору @{SUPPORT_TG_USERNAME}.",
+            reply_markup=kb_support_inline(),
         )
         return
 
@@ -3607,10 +3616,9 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
                     )
             await tg_send_text(
                 chat_id,
-                "Создали заявку, чтобы оператор связался с тобой и помог! Напиши сюда свой вопрос:",
-                reply_markup=kb_step_with_help(),
+                f"Создали заявку! Также ты можешь сразу написать нашему оператору в Telegram: @{SUPPORT_TG_USERNAME} 🙌",
+                reply_markup=kb_support_inline(),
             )
-            set_user_state(chat_id, "help_waiting_problem", {"prev_step": None, "prev_data": {}})
             return
 
         if norm_cmd in ("нет", "no", "не осталось"):
@@ -3630,22 +3638,16 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         )
         return
 
+    # ================= КНОПКА «ПОМОЩЬ» -> СРАЗУ ОТКРЫВАЕТ ЧАТ @LUNAPARK_DR =================
     if norm_cmd in ("помощь", "нужна помощь", "поддержка", "оператор"):
-        prev_step = state.get("step")
-        prev_data = state.get("data") or {}
-        set_user_state(chat_id, "help_waiting_problem", {"prev_step": prev_step, "prev_data": prev_data})
         await tg_send_text(
             chat_id,
-            "Напиши свой вопрос — подключим оператора и всё подскажем прямо здесь 🙌",
-            reply_markup=kb_step_with_help(),
+            f"Нажми на кнопку ниже, чтобы сразу открыть чат с оператором @{SUPPORT_TG_USERNAME} 🙌",
+            reply_markup=kb_support_inline(),
         )
         return
 
     if norm_cmd in ("отмена", "отменить", "cancel"):
-        if step == "help_waiting_problem" and data.get("prev_step"):
-            set_user_state(chat_id, data["prev_step"], data.get("prev_data") or {})
-            await send_ephemeral_text(chat_id, "Отменили, продолжаем 👍", reply_markup=kb_step_with_help(), ttl_sec=8)
-            return
         if step and step.startswith("reg_"):
             set_user_state(chat_id, "cancel_ask_questions", {"reg_data": data})
             await tg_send_text(
@@ -3655,61 +3657,6 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             )
             return
         await send_start_menu(chat_id, first_name=first_name)
-        return
-
-    if step == "help_waiting_problem":
-        if not raw_text and not file_id:
-            await send_ephemeral_text(
-                chat_id,
-                "Напиши текстом или скинь скриншот, что случилось:",
-                reply_markup=kb_step_with_help(),
-                ttl_sec=10,
-            )
-            return
-        problem_body = raw_text or "[Прикреплено фото / файл]"
-        set_user_state(chat_id, data.get("prev_step"), data.get("prev_data") or {})
-        set_last_help_courier(chat_id)
-
-        tg_login = format_tg_login(chat_id, tg_username)
-        tg_link = format_tg_link(chat_id, tg_username)
-        phone = get_user_record(chat_id).get("phone") or "—"
-
-        await send_help_to_amocrm(
-            problem_text=problem_body,
-            chat_id=chat_id,
-            tg_username=tg_username,
-            full_name=contact_name,
-        )
-
-        op_card = (
-            "🆘 Новое обращение «Помощь»\n\n"
-            f"👤 Имя: {contact_name}\n"
-            f"📱 Телефон: {phone}\n"
-            f"💬 Telegram: {tg_login} ({tg_link})\n"
-            f"🆔 chat_id: {chat_id}\n\n"
-            f"Текст:\n{problem_body}\n\n"
-            f"👉 Войти в живой чат: /chat {chat_id}"
-        )
-
-        notified_targets: set[str] = set()
-        if OPERATOR_CHAT_ID:
-            notified_targets.add(OPERATOR_CHAT_ID)
-        for admin_id in load_admin_config()["admins"]:
-            notified_targets.add(admin_id)
-
-        for target in notified_targets:
-            if str(target) == str(chat_id):
-                continue
-            await tg_send_text(target, op_card)
-            if file_id:
-                await tg_send_photo(target, file_id, caption=f"Вложение от {contact_name} (ID: {chat_id})")
-
-        await send_ephemeral_text(
-            chat_id,
-            "Приняли твой вопрос! Оператор скоро ответит здесь 💙",
-            reply_markup=kb_start_menu(is_admin=is_adm),
-            ttl_sec=20,
-        )
         return
 
     bound_operator = get_courier_active_operator(chat_id)
@@ -4132,8 +4079,8 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if ai_ans:
             await tg_send_text(
                 chat_id,
-                f"{ai_ans}\n\nЕсли нужен оператор — нажми «❓ Помощь».",
-                reply_markup=kb_start_menu(is_admin=is_adm),
+                f"{ai_ans}\n\nЕсли нужен оператор — пиши @{SUPPORT_TG_USERNAME} или нажми кнопку ниже:",
+                reply_markup=kb_support_inline(),
             )
             return
 
@@ -4351,7 +4298,6 @@ def _wazzup_to_telegram_update(payload: dict[str, Any]) -> dict[str, Any] | None
     """Convert one Wazzup message.add data item into the bot's update shape."""
     msg = payload.get("message") if isinstance(payload.get("message"), dict) else payload
 
-    # Формат Wazzup API v3: {"messages": [{messageId, channelId, chatType, chatId, ...}]}
     if "messageId" in msg or ("chatId" in msg and "chatType" in msg):
         if msg.get("isEcho") or msg.get("isDeleted"):
             return None
@@ -4404,9 +4350,6 @@ def _wazzup_to_telegram_update(payload: dict[str, Any]) -> dict[str, Any] | None
     recipient = msg.get("recipient") if isinstance(msg.get("recipient"), dict) else {}
     sender = msg.get("sender") if isinstance(msg.get("sender"), dict) else {}
 
-    # For an inbound 1:1 Telegram message Wazzup puts the contact's Telegram
-    # peer ID in recipient.chat_id. Some event variants also expose chat_id at
-    # the message root or sender.chat_id.
     chat_id = (
         msg.get("chat_id") or msg.get("chatId")
         or recipient.get("chat_id") or recipient.get("chatId")
@@ -4481,9 +4424,6 @@ def _wazzup_get_channel_id(obj: dict[str, Any]) -> str:
 
 
 async def handle_wazzup_webhook(request: web.Request) -> web.Response:
-    # Wazzup sends the value configured in webhook subscription's
-    # authorization_header as the HTTP Authorization header.
-    # Keep support for the previous query/header scheme during migration.
     expected = WAZZUP_WEBHOOK_AUTHORIZATION or WAZZUP_WEBHOOK_SECRET
     if expected:
         authorization = request.headers.get("Authorization", "").strip()
@@ -4516,8 +4456,6 @@ async def handle_wazzup_webhook(request: web.Request) -> web.Response:
     if not isinstance(payload, dict):
         return web.json_response({"ok": True, "ignored": "not_object"})
 
-    # Wazzup API v3: {"messages": [...]}, {"statuses": [...]}, {"test": true},
-    # {"channelsUpdates": [...]} — поля "event" в этом формате нет.
     v3_messages = payload.get("messages")
     if isinstance(v3_messages, list):
         items = [item for item in v3_messages if isinstance(item, dict)]
@@ -4529,7 +4467,6 @@ async def handle_wazzup_webhook(request: web.Request) -> web.Response:
             logger.debug("Wazzup webhook: событие пропущено, keys=%s", list(payload.keys()))
             return web.json_response({"ok": True, "ignored": event or "unknown_event"})
 
-        # Старый/альтернативный формат: payload.data — массив сообщений.
         raw_items = payload.get("data")
         if isinstance(raw_items, list):
             items = [item for item in raw_items if isinstance(item, dict)]
@@ -4565,8 +4502,6 @@ async def handle_wazzup_webhook(request: web.Request) -> web.Response:
             ignored += 1
             continue
 
-        # Mark before scheduling the handler so concurrent webhook retries
-        # cannot enqueue the same inbound message twice.
         if message_id:
             _WAZZUP_SEEN_MESSAGES[message_id] = now
         asyncio.create_task(handle_telegram_update(update))
@@ -4629,8 +4564,6 @@ async def handle_tg_webhook(request: web.Request) -> web.Response:
 
 async def wazzup_register_webhook() -> None:
     """Прописывает в Wazzup адрес вебхука с секретом в query string."""
-    # Даём aiohttp время начать принимать запросы: Wazzup может сразу
-    # отправить на новый адрес тестовый POST.
     await asyncio.sleep(5)
 
     if not WAZZUP_PUBLIC_URL:
