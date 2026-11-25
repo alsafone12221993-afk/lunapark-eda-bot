@@ -336,6 +336,7 @@ ADMIN_CONFIG_FILE = "admin_config.json"
 PENDING_DEMANDS_FILE = "pending_demands.json"
 AUTH_GUARD_FILE = "auth_guard.json"
 PHONE_OWNERS_FILE = "phone_owners.json"
+BOT_ACTIVITY_FILE = "bot_user_activity.json"
 
 FLEET_API_URL = "https://fleet-api.taxi.yandex.net"
 
@@ -460,6 +461,7 @@ def kb_admin_menu(is_superadmin: bool = False) -> dict[str, Any]:
         ["🗓 Период", "📣 Массовая рассылка"],
         ["🔥 Проверить спрос"],
     ]
+    rows.append(["👥 Пользователи бота"])
     if is_superadmin:
         rows.append(["👥 Админы", "🔓 Сбросить привязку"])
     rows.append(["⬅️ В начало"])
@@ -2844,6 +2846,66 @@ async def get_live_park_activity_stats() -> dict[str, int]:
     }
 
 
+def track_bot_user_activity(chat_id: int | str, username: str = "", full_name: str = "", action: str = "message") -> None:
+    data = _read_json(BOT_ACTIVITY_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    key = str(chat_id)
+    rec = data.get(key) if isinstance(data.get(key), dict) else {}
+    now = datetime.now(timezone.utc).isoformat()
+    rec.setdefault("first_seen_at", now)
+    rec["last_seen_at"] = now
+    rec["username"] = username.lstrip("@").strip() or rec.get("username", "")
+    rec["full_name"] = full_name.strip() or rec.get("full_name", "")
+    rec["message_count"] = int(rec.get("message_count") or 0) + 1
+    if action == "start":
+        rec["start_count"] = int(rec.get("start_count") or 0) + 1
+    elif action == "connect":
+        rec["connect_clicks"] = int(rec.get("connect_clicks") or 0) + 1
+        rec["last_connect_at"] = now
+    elif action == "already_courier":
+        rec["already_courier_clicks"] = int(rec.get("already_courier_clicks") or 0) + 1
+        rec["last_already_courier_at"] = now
+    data[key] = rec
+    _write_json(BOT_ACTIVITY_FILE, data)
+
+
+def build_bot_users_admin_text() -> str:
+    activity = _read_json(BOT_ACTIVITY_FILE, {})
+    users = _read_json(USERS_FILE, {})
+    if not isinstance(activity, dict): activity = {}
+    if not isinstance(users, dict): users = {}
+    now = datetime.now(timezone.utc)
+    parsed = []
+    connect_total = already_total = active24 = active7 = inactive30 = 0
+    for uid, rec in activity.items():
+        if not isinstance(rec, dict): continue
+        connect_total += int(rec.get("connect_clicks") or 0)
+        already_total += int(rec.get("already_courier_clicks") or 0)
+        raw = rec.get("last_seen_at") or rec.get("first_seen_at")
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+            age = now - dt.astimezone(timezone.utc)
+            if age <= timedelta(hours=24): active24 += 1
+            if age <= timedelta(days=7): active7 += 1
+            if age > timedelta(days=30): inactive30 += 1
+        except Exception: age = None
+        parsed.append((str(raw or ""), str(uid), rec, age))
+    parsed.sort(key=lambda x: x[0], reverse=True)
+    out = ["👥 АНАЛИТИКА ПОЛЬЗОВАТЕЛЕЙ БОТА", "", f"Всего пользователей: {len(activity)}", f"Активны за 24 часа: {active24}", f"Активны за 7 дней: {active7}", f"Неактивны более 30 дней: {inactive30}", f"Нажатий «🚀 Подключиться»: {connect_total}", f"Нажатий «✅ Уже курьер»: {already_total}", f"Пользователей с профилем/данными в базе: {len(users)}", "", "Последние пользователи (до 20):"]
+    for _, uid, rec, age in parsed[:20]:
+        name = str(rec.get("full_name") or "Пользователь").replace("\n", " ")[:40]
+        username = "@" + rec["username"] if rec.get("username") else "без username"
+        raw_last = rec.get("last_seen_at") or "—"
+        try: last = datetime.fromisoformat(str(raw_last).replace("Z", "+00:00")).astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M")
+        except Exception: last = str(raw_last)
+        status = "🟢 активен за 24ч" if age is not None and age <= timedelta(hours=24) else ("🟡 был за 7д" if age is not None and age <= timedelta(days=7) else "⚪ неактивен")
+        out.append(f"\n{name} · {username}\nID: {uid} · {status}\nПоследняя активность: {last}\nПодключиться: {int(rec.get('connect_clicks') or 0)} · Уже курьер: {int(rec.get('already_courier_clicks') or 0)}")
+    out += ["", "Примечание: Telegram не сообщает боту, что пользователь удалил чат или нажал «выйти». Поэтому неактивность определяется по дате последнего действия, а не как подтверждённый выход."]
+    return "\n".join(out)[:3900]
+
+
 async def build_admin_summary_text(period_days: int) -> str:
     users_db = _read_json(USERS_FILE, {})
     apps = _read_json(APPS_FILE, [])
@@ -3922,6 +3984,8 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
 
     save_user_session(chat_id, username=tg_username, full_name=contact_name)
     norm_cmd = normalize_choice_text(raw_text)
+    action = "start" if raw_text == "/start" else ("connect" if norm_cmd in ("подключиться", "подключиться к парку", "регистрация", "стать курьером") else ("already_courier" if norm_cmd in ("уже курьер", "уже курьер парка", "кабинет", "мой кабинет", "сменить номер", "изменить номер аккаунта") else "message"))
+    track_bot_user_activity(chat_id, tg_username, contact_name, action)
 
     if norm_cmd in ("обучение", "группа обучения") and get_user_record(chat_id).get("phone"):
         await tg_send_text(
@@ -3990,6 +4054,10 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             await tg_send_text(chat_id, f"🔓 Привязка номера {target_p} сброшена.", reply_markup=kb_admin_menu(True))
         else:
             await tg_send_text(chat_id, f"Номер {target_p} не был привязан.", reply_markup=kb_admin_menu(True))
+        return
+
+    if is_adm and norm_cmd in ("пользователи бота", "аналитика пользователей", "пользователи"):
+        await tg_send_text(chat_id, build_bot_users_admin_text(), reply_markup=kb_admin_menu(is_super))
         return
 
     if is_adm and norm_cmd in ("админка", "сводка за период"):
@@ -4199,11 +4267,11 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         set_user_state(chat_id, "start", {})
         await tg_send_text(
             chat_id,
-            "🍔 Хочешь начать доставлять заказы в Яндекс Еде вместе с Лунапарком?\n\n"
-            "Первый шаг — подключить профиль Яндекс Еды к нашему парку.\n\n"
-            "Перейди в бота поддержки и напиши, что хочешь подключиться к Лунапарку. "
-            "Специалист поможет оформить профиль и подскажет, что делать дальше.\n\n"
-            "👉 Нажми кнопку «Подключить профиль» ниже. До встречи на линии! 🚀",
+            "🍔 Хочешь подключиться к Яндекс Еде?\n\n"
+            "Перейди в бота поддержки и напиши, что хочешь подключиться к Яндекс Еде. "
+            "Специалист поможет оформить подключение и подскажет, что делать дальше.\n\n"
+            "После подключения возвращайся в этот бот, нажимай «✅ Уже курьер» "
+            "и пользуйся ботом и его преимуществами Лунапарка! 🚀",
             reply_markup={"inline_keyboard": [[{"text": "🍔 Подключить профиль", "url": CONNECT_PROFILE_URL}]]},
         )
         return
