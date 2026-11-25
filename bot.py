@@ -347,8 +347,8 @@ GOAL_BONUS = 500
 LUNAPARK_STUDY_URL = os.getenv("LUNAPARK_STUDY_URL", "https://t.me/LUNAPARK_study").strip()
 LUNAPARK_CHAT_URL = os.getenv("LUNAPARK_CHAT_URL", "https://t.me/LUNAPARK_chat").strip()
 MSK_TZ = timezone(timedelta(hours=3))
-SUPPORT_CHAT_URL = os.getenv("SUPPORT_CHAT_URL", "https://t.me/LUNAPARK_DR").strip()
-SUPPORT_CHAT_USERNAME = "@LUNAPARK_DR"
+SUPPORT_CHAT_URL = os.getenv("SUPPORT_CHAT_URL", "https://t.me/@Lunapark_support_bot").strip()
+SUPPORT_CHAT_USERNAME = "@Lunapark_support_bot"
 SUPPORT_PHONE_DISPLAY = "+7 (999) 515-70-42"
 INCOME_CACHE: dict[str, dict[str, Any]] = {}
 INCOME_TTL_SEC = 60
