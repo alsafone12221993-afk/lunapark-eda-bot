@@ -324,6 +324,9 @@ USERS_FILE = "users_db.json"
 APPS_FILE = "applications.json"
 DRIVERS_CACHE_FILE = "drivers_cache.json"
 CLIENT_LEADS_FILE = "client_leads.json"
+AMO_HELP_SESSIONS_FILE = "amo_help_sessions.json"
+# Сколько часов после обращения «Помощь» сообщения курьера уходят менеджеру в сделку amoCRM.
+AMO_HELP_SESSION_TTL_SEC = int(float(os.getenv("AMO_HELP_SESSION_HOURS", "12")) * 3600)
 CRM_ENTITY_MAP_FILE = "crm_entity_map.json"
 STATES_FILE = "user_states.json"
 DELAYED_TASKS_FILE = "delayed_notifications.json"
@@ -340,6 +343,18 @@ GOAL_ORDERS = 5
 GOAL_HIDE_AFTER_ORDERS = 5
 GOAL_DAYS = 14
 GOAL_BONUS = 500
+
+LUNAPARK_STUDY_URL = os.getenv("LUNAPARK_STUDY_URL", "https://t.me/LUNAPARK_study").strip()
+LUNAPARK_CHAT_URL = os.getenv("LUNAPARK_CHAT_URL", "https://t.me/LUNAPARK_chat").strip()
+MSK_TZ = timezone(timedelta(hours=3))
+SUPPORT_CHAT_URL = os.getenv("SUPPORT_CHAT_URL", "https://t.me/LUNAPARK_DR").strip()
+SUPPORT_CHAT_USERNAME = "@LUNAPARK_DR"
+SUPPORT_PHONE_DISPLAY = "+7 (999) 515-70-42"
+INCOME_CACHE: dict[str, dict[str, Any]] = {}
+INCOME_TTL_SEC = 60
+ORDER_DISTANCES_FILE = "order_distances.json"
+# Сколько заказов без расстояния за одно обновление статистики догружаем через трек заказа.
+TRACK_FETCH_LIMIT = int(os.getenv("TRACK_FETCH_LIMIT", "20"))
 PROFILE_READY_DELAY_SEC = 360
 AFTER_10M_REMINDER_DELAY_SEC = 5
 
@@ -431,6 +446,7 @@ def _reply_kb(
 def kb_start_menu(is_admin: bool = False) -> dict[str, Any]:
     rows: list[list[str | dict[str, Any]]] = [
         ["🚀 Подключиться", "✅ Уже курьер"],
+        ["📚 Обучение", "💬 Чат курьеров"],
         ["❓ Помощь"],
     ]
     if is_admin:
@@ -513,14 +529,17 @@ def kb_courier_cabinet(show_bonus: bool = True) -> dict[str, Any]:
     if show_bonus:
         rows: list[list[str | dict[str, Any]]] = [
             ["📊 Моя статистика", "🎁 Бонус"],
-            ["⚖️ Корректировки", "❓ Помощь"],
-            ["🔄 Сменить номер", "⬅️ В начало"],
+            ["💰 Доход в парке", "⚖️ Корректировки"],
+            ["📚 Обучение", "💬 Чат курьеров"],
+            ["❓ Помощь", "🔄 Сменить номер"],
+            ["⬅️ В начало"],
         ]
     else:
         rows = [
-            ["📊 Моя статистика", "⚖️ Корректировки"],
-            ["❓ Помощь", "🔄 Сменить номер"],
-            ["⬅️ В начало"],
+            ["📊 Моя статистика", "💰 Доход в парке"],
+            ["⚖️ Корректировки", "📚 Обучение"],
+            ["💬 Чат курьеров", "❓ Помощь"],
+            ["🔄 Сменить номер", "⬅️ В начало"],
         ]
     return _reply_kb(rows)
 
@@ -1094,6 +1113,25 @@ def save_client_lead(chat_id: int | str, lead_id: int) -> None:
     _write_json(CLIENT_LEADS_FILE, data)
 
 
+def open_amo_help_session(chat_id: int | str) -> None:
+    """Открывает (или продлевает) окно, в котором сообщения курьера идут в amoCRM."""
+    data = _read_json(AMO_HELP_SESSIONS_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    now = time.time()
+    data = {k: v for k, v in data.items() if isinstance(v, (int, float)) and v > now}
+    data[str(chat_id)] = now + AMO_HELP_SESSION_TTL_SEC
+    _write_json(AMO_HELP_SESSIONS_FILE, data)
+
+
+def is_amo_help_session_active(chat_id: int | str) -> bool:
+    data = _read_json(AMO_HELP_SESSIONS_FILE, {})
+    if not isinstance(data, dict):
+        return False
+    until = data.get(str(chat_id))
+    return isinstance(until, (int, float)) and until > time.time()
+
+
 def link_crm_entity_to_tg(lead_id: int | None, contact_id: int | None, tg_chat_id: int | str) -> None:
     mapping = _read_json(CRM_ENTITY_MAP_FILE, {})
     if not isinstance(mapping, dict):
@@ -1547,6 +1585,34 @@ async def _add_amocrm_contact_note(
     async with session.post(notes_url, headers=_amocrm_headers(), json=notes_payload, timeout=15) as nresp:
         if nresp.status not in (200, 201, 202):
             logger.warning("amoCRM contact note warning (%s): %s", nresp.status, await nresp.text())
+
+
+async def relay_courier_message_to_amocrm(
+    chat_id: int | str,
+    text: str,
+    full_name: str,
+    has_attachment: bool = False,
+) -> bool:
+    """Добавляет сообщение курьера примечанием в его сделку amoCRM."""
+    if not AMOCRM_BASE_URL or not AMOCRM_ACCESS_TOKEN:
+        return False
+    lead_id = load_client_leads().get(str(chat_id))
+    if not lead_id:
+        logger.warning("amoCRM: для chat_id=%s нет привязанной сделки, сообщение не передано", chat_id)
+        return False
+    body = (text or "").strip()
+    if has_attachment:
+        body = (body + "\n" if body else "") + "[приложено фото/файл — смотри в Telegram]"
+    if not body:
+        return False
+    note = f"Курьер {full_name or chat_id} (TG {chat_id}):\n{body}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            await _add_amocrm_note(session, AMOCRM_BASE_URL.rstrip("/"), int(lead_id), note)
+        return True
+    except Exception:
+        logger.exception("amoCRM: не удалось добавить сообщение курьера в сделку %s", lead_id)
+        return False
 
 
 async def _find_or_create_contact_id(
@@ -2146,7 +2212,59 @@ def _extract_order_distance_km(order: dict[str, Any]) -> float:
                 if rv > 0:
                     return rv
 
+    return _deep_find_distance_km(order)
+
+
+def _deep_find_distance_km(obj: Any, depth: int = 0) -> float:
+    """Ищет в заказе (в том числе во вложенных объектах) любое поле с пробегом/расстоянием."""
+    if depth > 4:
+        return 0.0
+    best = 0.0
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            low = str(key).lower()
+            if isinstance(val, (dict, list)):
+                best = max(best, _deep_find_distance_km(val, depth + 1))
+            elif ("mileage" in low or "distance" in low) and "eta" not in low:
+                best = max(best, _normalize_dist_value_to_km(val, low))
+    elif isinstance(obj, list):
+        for item in obj[:50]:
+            best = max(best, _deep_find_distance_km(item, depth + 1))
+    return best
+
+
+def _extract_order_price(order: dict[str, Any]) -> float:
+    for key in ("price", "cost", "total_price", "order_price"):
+        if key in order and order[key] is not None:
+            v = _safe_float(order[key])
+            if v > 0:
+                return v
     return 0.0
+
+
+def _load_order_distances() -> dict[str, Any]:
+    data = _read_json(ORDER_DISTANCES_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+async def _fetch_order_track_km(
+    session: aiohttp.ClientSession,
+    park: dict[str, str],
+    order_id: str,
+) -> float:
+    """Расстояние по треку заказа (Fleet API: orders/track, distance в метрах от первой точки)."""
+    data = await _post_fleet_with_retry(
+        session,
+        park,
+        "/v1/parks/orders/track",
+        {"order_id": order_id, "park_id": park["park_id"]},
+        max_attempts=2,
+    )
+    best_m = 0.0
+    for point in data.get("track") or []:
+        if isinstance(point, dict):
+            best_m = max(best_m, _safe_float(point.get("distance")))
+    return best_m / 1000.0
 
 
 def _short_first_name(full_name: str) -> str:
@@ -2314,6 +2432,8 @@ def _extract_matches_in_park(
                 "balance": _safe_float(balance_raw),
                 "city": city,
                 "category": category,
+                "has_car": bool(car),
+                "transport_hint": str(category),
             })
     return matches
 
@@ -2373,6 +2493,47 @@ def _is_active_in_progress_order_status(status: str) -> bool:
     )
 
 
+def _empty_periods() -> dict[str, dict[str, Any]]:
+    return {k: {"orders": 0, "earned": 0.0, "km": 0.0, "km_missing": 0} for k in ("day", "week", "month")}
+
+
+async def _fetch_driver_orders_window(
+    session: aiohttp.ClientSession,
+    park: dict[str, str],
+    driver_id: str,
+    dt_from: datetime,
+    dt_to: datetime,
+) -> list[dict[str, Any]]:
+    orders: list[dict[str, Any]] = []
+    cursor: Any = None
+    for _ in range(6):
+        payload: dict[str, Any] = {
+            "query": {
+                "park": {
+                    "id": park["park_id"],
+                    "driver_profile": {"id": driver_id},
+                    "order": {
+                        "booked_at": {
+                            "from": dt_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "to": dt_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        }
+                    },
+                }
+            },
+            "limit": 500,
+        }
+        if cursor:
+            payload["cursor"] = cursor
+        data = await _post_fleet_with_retry(session, park, "/v1/parks/orders/list", payload)
+        batch = [o for o in (data.get("orders") or []) if isinstance(o, dict)]
+        orders.extend(batch)
+        next_cursor = data.get("cursor")
+        if not batch or not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+    return orders
+
+
 async def _get_driver_orders_stats(
     session: aiohttp.ClientSession,
     park: dict[str, str],
@@ -2389,28 +2550,13 @@ async def _get_driver_orders_stats(
 
         now = datetime.now(timezone.utc)
         week_ago = now - timedelta(days=7)
+        month_ago = now - timedelta(days=30)
+        day_start = datetime.now(MSK_TZ).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         goal_end = goal_start_dt + timedelta(days=GOAL_DAYS)
-        window_from = min(week_ago, goal_start_dt)
-        window_to = now
-
-        payload = {
-            "query": {
-                "park": {
-                    "id": park["park_id"],
-                    "driver_profile": {"id": driver_id},
-                    "order": {
-                        "booked_at": {
-                            "from": window_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            "to": window_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        }
-                    },
-                }
-            },
-            "limit": 500,
-        }
+        window_from = min(month_ago, goal_start_dt)
 
         try:
-            data = await _post_fleet_with_retry(session, park, "/v1/parks/orders/list", payload)
+            orders = await _fetch_driver_orders_window(session, park, driver_id, window_from, now)
         except Exception as exc:
             logger.warning("orders/list ошибка для %s: %s", driver_id, exc)
             if cached and cached.get("data", {}).get("ok"):
@@ -2423,34 +2569,88 @@ async def _get_driver_orders_stats(
                 "within_goal_window": now <= goal_end,
                 "distance_km_7d": 0.0,
                 "distance_estimated": False,
+                "periods": _empty_periods(),
             }
 
-        completed_7d = 0
+        starts = {"day": day_start, "week": week_ago, "month": month_ago}
+        agg = _empty_periods()
         completed_goal = 0
-        distance_km_7d = 0.0
+        known_dist = _load_order_distances()
+        pending: list[tuple[datetime, str, list[str]]] = []
+        logged_keys = False
 
-        for order in data.get("orders", []):
-            if not isinstance(order, dict):
+        for order in orders:
+            if not _is_completed_order_status(str(order.get("status") or "")):
                 continue
-            status = str(order.get("status") or "")
-            dist_km = _extract_order_distance_km(order)
             odt = _parse_order_dt(order)
+            keys = [k for k, st in starts.items() if (odt is not None and odt >= st) or (odt is None and k != "day")]
+            if odt is None or (goal_start_dt <= odt <= goal_end):
+                completed_goal += 1
+            if not keys:
+                continue
 
-            if _is_completed_order_status(status):
-                if odt is None or odt >= week_ago:
-                    completed_7d += 1
-                    distance_km_7d += dist_km
-                if odt is None or (goal_start_dt <= odt <= goal_end):
-                    completed_goal += 1
+            price = _extract_order_price(order)
+            dist_km = _extract_order_distance_km(order)
+            oid = str(order.get("id") or "").strip()
+            if dist_km <= 0 and oid:
+                entry = known_dist.get(f"{park['park_id']}:{oid}")
+                if isinstance(entry, dict) and _safe_float(entry.get("km")) > 0:
+                    dist_km = _safe_float(entry.get("km"))
+
+            for k in keys:
+                agg[k]["orders"] += 1
+                agg[k]["earned"] += price
+                agg[k]["km"] += dist_km
+                if dist_km <= 0:
+                    agg[k]["km_missing"] += 1
+
+            if dist_km <= 0 and oid:
+                if not logged_keys:
+                    logger.info("orders/list: у заказа нет расстояния, поля заказа: %s", sorted(order.keys()))
+                    logged_keys = True
+                pending.append((odt or now, oid, keys))
+
+        # Догружаем расстояние по трекам (самые свежие заказы первыми), результат кэшируем в файл.
+        if pending:
+            pending.sort(key=lambda x: x[0], reverse=True)
+            fetched = 0
+            changed = False
+            for odt, oid, keys in pending:
+                if fetched >= TRACK_FETCH_LIMIT:
+                    break
+                ck = f"{park['park_id']}:{oid}"
+                prev = known_dist.get(ck)
+                if isinstance(prev, dict) and _safe_float(prev.get("km")) <= 0 and time.time() - float(prev.get("ts") or 0) < 6 * 3600:
+                    continue
+                fetched += 1
+                try:
+                    km = await _fetch_order_track_km(session, park, oid)
+                except Exception as exc:
+                    logger.warning("orders/track: не удалось получить трек заказа %s: %s", oid, exc)
+                    break
+                known_dist[ck] = {"km": round(km, 3), "ts": time.time()}
+                changed = True
+                if km > 0:
+                    for k in keys:
+                        agg[k]["km"] += km
+                        agg[k]["km_missing"] = max(0, agg[k]["km_missing"] - 1)
+                await asyncio.sleep(0.3)
+            if changed:
+                _write_json(ORDER_DISTANCES_FILE, known_dist)
+
+        for k in agg:
+            agg[k]["earned"] = round(agg[k]["earned"], 2)
+            agg[k]["km"] = round(agg[k]["km"], 1)
 
         result = {
             "ok": True,
             "error": "",
-            "completed_7d": completed_7d,
+            "completed_7d": agg["week"]["orders"],
             "completed_goal": completed_goal,
             "within_goal_window": now <= goal_end,
-            "distance_km_7d": round(distance_km_7d, 1),
+            "distance_km_7d": agg["week"]["km"],
             "distance_estimated": False,
+            "periods": agg,
         }
         DRIVER_STATS_CACHE[cache_key] = {"ts": now_mono, "data": result}
         return result
@@ -3000,6 +3200,208 @@ async def show_courier_welcome(chat_id: int | str, driver: dict[str, Any]) -> No
     )
 
 
+def _support_inline_kb() -> dict[str, Any]:
+    return {"inline_keyboard": [[{"text": "💬 Написать в поддержку", "url": SUPPORT_CHAT_URL}]]}
+
+
+_INCOME_SKIP_ALWAYS = ("вывод", "перевод", "налог", "ндфл", "самозанят", "псмз", "пополн")
+_WEEKDAYS_RU = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
+
+
+def _income_skip(cat_name: str, desc: str, amount: float) -> bool:
+    low = f"{cat_name} {desc}".lower()
+    if any(w in low for w in _INCOME_SKIP_ALWAYS):
+        return True
+    # Выплата курьеру (вывод денег) уменьшает баланс — это не доход.
+    if "выплат" in low and amount < 0:
+        return True
+    return False
+
+
+def _parse_tx_dt(tx: dict[str, Any]) -> Optional[datetime]:
+    raw = tx.get("event_at") or tx.get("created_at")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+async def _fetch_driver_transactions(
+    session: aiohttp.ClientSession,
+    park: dict[str, str],
+    driver_id: str,
+    dt_from: datetime,
+    dt_to: datetime,
+) -> list[dict[str, Any]]:
+    base_payload: dict[str, Any] = {
+        "query": {
+            "park": {
+                "id": park["park_id"],
+                "driver_profile": {"id": driver_id},
+                "transaction": {
+                    "event_at": {
+                        "from": dt_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "to": dt_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    }
+                },
+            }
+        },
+        "limit": 200,
+    }
+    last_exc: Exception | None = None
+    for ep in ("/v2/parks/driver-profiles/transactions/list", "/v1/parks/driver-profiles/transactions/list"):
+        result: list[dict[str, Any]] = []
+        cursor: Any = None
+        try:
+            for _ in range(10):
+                payload = dict(base_payload)
+                if cursor:
+                    payload["cursor"] = cursor
+                data = await _post_fleet_with_retry(session, park, ep, payload)
+                raw_tx = data.get("transactions") or data.get("items") or data.get("driver_transactions") or []
+                batch = [x for x in raw_tx if isinstance(x, dict)] if isinstance(raw_tx, list) else []
+                result.extend(batch)
+                next_cursor = data.get("cursor")
+                if not batch or not next_cursor or next_cursor == cursor:
+                    break
+                cursor = next_cursor
+            return result
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise RuntimeError(f"transactions/list недоступен: {last_exc}")
+
+
+async def _get_driver_income(
+    session: aiohttp.ClientSession,
+    park: dict[str, str],
+    driver_id: str,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    cache_key = f"{park['park_id']}:{driver_id}"
+    cached = INCOME_CACHE.get(cache_key)
+    now_mono = time.monotonic()
+    if not force_refresh and cached and (now_mono - cached["ts"]) < INCOME_TTL_SEC:
+        return cached["data"]
+
+    now = datetime.now(timezone.utc)
+    month_ago = now - timedelta(days=30)
+    week_ago = now - timedelta(days=7)
+    prev_week_start = now - timedelta(days=14)
+    day_start = datetime.now(MSK_TZ).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+
+    txs = await _fetch_driver_transactions(session, park, driver_id, month_ago, now)
+
+    totals = {"today": 0.0, "week": 0.0, "prev_week": 0.0, "month": 0.0}
+    weekday_sums: dict[int, float] = defaultdict(float)
+    active_days: set[str] = set()
+    categories: dict[str, float] = defaultdict(float)
+    used = 0
+
+    for tx in txs:
+        cat_name = str(tx.get("category_name") or tx.get("category_id") or "").strip()
+        desc = str(tx.get("description") or tx.get("comment") or tx.get("reason") or "").strip()
+        amount = _safe_float(tx.get("amount") if tx.get("amount") is not None else tx.get("value"))
+        if amount == 0:
+            continue
+        categories[cat_name or "(без названия)"] += amount
+        if _income_skip(cat_name, desc, amount):
+            continue
+        dt = _parse_tx_dt(tx)
+        if dt is None:
+            continue
+        used += 1
+        totals["month"] += amount
+        if dt >= week_ago:
+            totals["week"] += amount
+        elif dt >= prev_week_start:
+            totals["prev_week"] += amount
+        if dt >= day_start:
+            totals["today"] += amount
+        local = dt.astimezone(MSK_TZ)
+        weekday_sums[local.weekday()] += amount
+        active_days.add(local.strftime("%Y-%m-%d"))
+
+    logger.info(
+        "income: категории транзакций за 30 дней (driver %s): %s",
+        driver_id,
+        {k: round(v, 2) for k, v in sorted(categories.items(), key=lambda kv: -abs(kv[1]))[:15]},
+    )
+
+    best_weekday: Optional[int] = None
+    if len(active_days) >= 3 and weekday_sums:
+        top_idx, top_val = max(weekday_sums.items(), key=lambda kv: kv[1])
+        if top_val > 0:
+            best_weekday = top_idx
+
+    data = {
+        "today": round(totals["today"], 2),
+        "week": round(totals["week"], 2),
+        "prev_week": round(totals["prev_week"], 2),
+        "month": round(totals["month"], 2),
+        "tx_count": used,
+        "best_weekday": best_weekday,
+    }
+    INCOME_CACHE[cache_key] = {"ts": now_mono, "data": data}
+    return data
+
+
+def _fmt_rub(value: float) -> str:
+    sign = "−" if value < 0 else ""
+    return f"{sign}{int(round(abs(value))):,}".replace(",", " ") + " ₽"
+
+
+def _build_income_text(inc: dict[str, Any]) -> str:
+    if int(inc.get("tx_count") or 0) == 0:
+        return "За этот период пока нет операций. Как только выполнишь заказ, здесь появится доход 💪"
+
+    week = float(inc["week"])
+    prev = float(inc["prev_week"])
+    cmp_txt = ""
+    if prev > 0 and week > 0:
+        pct = round((week - prev) / prev * 100)
+        if pct >= 5:
+            cmp_txt = f" (на {pct}% больше, чем неделей раньше 🔥)"
+        elif pct <= -5:
+            cmp_txt = f" (на {abs(pct)}% меньше, чем неделей раньше)"
+        else:
+            cmp_txt = " (на уровне прошлой недели)"
+
+    lines = [
+        "💰 Твой доход в парке",
+        "",
+        f"📅 Сегодня: {_fmt_rub(float(inc['today']))}",
+        f"🗓 За 7 дней: {_fmt_rub(week)}{cmp_txt}",
+        f"📆 За 30 дней: {_fmt_rub(float(inc['month']))}",
+    ]
+    best = inc.get("best_weekday")
+    if best is not None:
+        lines += ["", f"Лучший день недели — {_WEEKDAYS_RU[int(best)]}. Так держать! 💪"]
+    elif week > 0:
+        lines += ["", "Так держать! 💪"]
+    lines += ["", "Суммы по данным парка и могут обновляться. Если что-то не сходится, жми «❓ Помощь»."]
+    return "\n".join(lines)
+
+
+async def show_courier_income(chat_id: int | str, driver: dict[str, Any]) -> None:
+    park = get_park_by_id(driver["park_id"])
+    try:
+        async with aiohttp.ClientSession() as session:
+            inc = await _get_driver_income(session, park, driver["id"], force_refresh=True)
+    except Exception:
+        logger.exception("Не удалось загрузить доход курьера %s", driver.get("id"))
+        await tg_send_text(
+            chat_id,
+            "Не получилось загрузить доход. Попробуй чуть позже или напиши в поддержку 💬",
+            reply_markup=_support_inline_kb(),
+        )
+        return
+    await tg_send_text(chat_id, _build_income_text(inc))
+
+
 async def show_courier_statistics(chat_id: int | str, driver: dict[str, Any]) -> None:
     park = get_park_by_id(driver["park_id"])
     goal_start = get_goal_start_dt(chat_id)
@@ -3022,21 +3424,64 @@ async def show_courier_statistics(chat_id: int | str, driver: dict[str, Any]) ->
         save_user_session(chat_id, bonus_completed=True)
 
     show_bonus = await should_show_bonus_button(chat_id, driver)
-    km_suffix = " км (примерно)" if stats.get("distance_estimated") else " км"
     footer = (
         "Отличный темп! Если захочешь посмотреть прогресс по бонусу — жми «🎁 Бонус»."
         if show_bonus
         else "Отличный темп! Хороших смен и щедрых заказов."
     )
+    periods = stats.get("periods") or _empty_periods()
+    icon, word = _courier_distance_label(driver)
+    blocks = [
+        _format_period_block("📅 Сегодня", periods.get("day") or {}, icon, word),
+        _format_period_block("🗓 За 7 дней", periods.get("week") or {}, icon, word),
+        _format_period_block("📆 За 30 дней", periods.get("month") or {}, icon, word),
+    ]
+    any_missing = any(int((periods.get(k) or {}).get("km_missing") or 0) > 0 for k in ("day", "week", "month"))
+    note = (
+        "\nℹ️ Километры посчитаны не по всем заказам — по части данных пока нет. Загляни позже, они подтянутся.\n"
+        if any_missing
+        else ""
+    )
     text = (
-        "Вот твоя свежая сводка за последние 7 дней ✨\n\n"
+        "📊 Твоя статистика\n\n"
         f"🏢 Парк: {driver['park_name']}\n"
-        f"💳 Баланс: {driver['balance']:.2f} ₽\n"
-        f"📦 Заказов выполнено: {stats['completed_7d']}\n"
-        f"🛣 Прошёл / проехал: {stats['distance_km_7d']:.1f}{km_suffix}\n\n"
-        f"{footer}"
+        f"💳 Баланс: {driver['balance']:.2f} ₽\n\n"
+        + "\n\n".join(blocks)
+        + "\n"
+        + note
+        + f"\n{footer}"
     )
     await tg_send_text(chat_id, text, reply_markup=kb_courier_cabinet(show_bonus=show_bonus))
+
+
+def _courier_distance_label(driver: dict[str, Any]) -> tuple[str, str]:
+    hint = str(driver.get("transport_hint") or driver.get("category") or "").lower()
+    if any(w in hint for w in ("пеш", "walk", "foot")):
+        return "🚶", "Прошёл"
+    if any(w in hint for w in ("вел", "bike", "самокат", "scooter")):
+        return "🚲", "Проехал"
+    if any(w in hint for w in ("мото", "moto", "скутер")):
+        return "🛵", "Проехал"
+    if driver.get("has_car"):
+        return "🚗", "Проехал"
+    return "🛣", "Прошёл / проехал"
+
+
+def _format_period_block(title: str, p: dict[str, Any], icon: str, word: str) -> str:
+    orders = int(p.get("orders") or 0)
+    earned = float(p.get("earned") or 0.0)
+    km = float(p.get("km") or 0.0)
+    missing = int(p.get("km_missing") or 0)
+    earned_txt = f"{earned:.0f} ₽" if earned > 0 else ("0 ₽" if orders == 0 else "—")
+    km_txt = f"{km:.1f} км"
+    if missing > 0 and orders > 0:
+        km_txt += " (не по всем заказам)"
+    return (
+        f"{title}\n"
+        f"📦 Заказов: {orders}\n"
+        f"💰 Заработано по заказам: {earned_txt}\n"
+        f"{icon} {word}: {km_txt}"
+    )
 
 
 async def get_saved_profile_or_redirect(chat_id: int | str) -> dict[str, Any] | None:
@@ -3478,6 +3923,27 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     save_user_session(chat_id, username=tg_username, full_name=contact_name)
     norm_cmd = normalize_choice_text(raw_text)
 
+    if norm_cmd in ("обучение", "группа обучения"):
+        await tg_send_text(
+            chat_id,
+            "📚 Группа для обучения\n\n"
+            "Здесь собраны материалы и подсказки для курьеров Лунапарка: как работать с приложением, "
+            "как выходить на стабильный заработок и где искать ответы на частые вопросы. "
+            "Заходи, читай и задавай вопросы — новичкам тут всегда рады 💙",
+            reply_markup={"inline_keyboard": [[{"text": "📚 Открыть группу обучения", "url": LUNAPARK_STUDY_URL}]]},
+        )
+        return
+
+    if norm_cmd in ("чат курьеров", "чат"):
+        await tg_send_text(
+            chat_id,
+            "💬 Чат курьеров Лунапарка\n\n"
+            "Живое общение с коллегами: делись опытом, спрашивай совета, узнавай новости парка "
+            "и находи напарников. Общаемся вежливо и помогаем друг другу 🤝",
+            reply_markup={"inline_keyboard": [[{"text": "💬 Открыть чат курьеров", "url": LUNAPARK_CHAT_URL}]]},
+        )
+        return
+
     if raw_text == "/start" or norm_cmd in ("в начало", "главное меню", "старт", "start", "меню"):
         await send_start_menu(chat_id, first_name=first_name)
         return
@@ -3631,13 +4097,17 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         return
 
     if norm_cmd in ("помощь", "нужна помощь", "поддержка", "оператор"):
-        prev_step = state.get("step")
-        prev_data = state.get("data") or {}
-        set_user_state(chat_id, "help_waiting_problem", {"prev_step": prev_step, "prev_data": prev_data})
+        # Состояние (шаг регистрации и т.п.) не трогаем: курьер продолжит с того же места.
         await tg_send_text(
             chat_id,
-            "Напиши свой вопрос — подключим оператора и всё подскажем прямо здесь 🙌",
-            reply_markup=kb_step_with_help(),
+            "🆘 Нужна помощь?\n\n"
+            "Напиши в поддержку парка, ответим как можно быстрее:\n"
+            f"👉 {SUPPORT_CHAT_USERNAME}\n"
+            "Чат поддержки работает с 8:00 до 23:00.\n\n"
+            f"📞 Или позвони: {SUPPORT_PHONE_DISPLAY}\n"
+            "Телефон работает с 9:00 до 18:00.\n\n"
+            "Укажи номер телефона из профиля, так мы быстрее найдём твой аккаунт.",
+            reply_markup=_support_inline_kb(),
         )
         return
 
@@ -3674,12 +4144,16 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         tg_link = format_tg_link(chat_id, tg_username)
         phone = get_user_record(chat_id).get("phone") or "—"
 
-        await send_help_to_amocrm(
+        help_ok, help_info = await send_help_to_amocrm(
             problem_text=problem_body,
             chat_id=chat_id,
             tg_username=tg_username,
             full_name=contact_name,
         )
+        if help_ok:
+            open_amo_help_session(chat_id)
+        else:
+            logger.warning("Обращение «Помощь» не ушло в amoCRM: %s", help_info)
 
         op_card = (
             "🆘 Новое обращение «Помощь»\n\n"
@@ -3706,7 +4180,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
 
         await send_ephemeral_text(
             chat_id,
-            "Приняли твой вопрос! Оператор скоро ответит здесь 💙",
+            "Приняли твой вопрос! Оператор скоро ответит здесь 💙\nМожешь дописывать — всё уйдёт менеджеру.",
             reply_markup=kb_start_menu(is_admin=is_adm),
             ttl_sec=20,
         )
@@ -3749,6 +4223,12 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         driver = await get_saved_profile_or_redirect(chat_id)
         if driver:
             await show_courier_statistics(chat_id, driver)
+        return
+
+    if norm_cmd in ("доход в парке", "мой доход", "доход"):
+        driver = await get_saved_profile_or_redirect(chat_id)
+        if driver:
+            await show_courier_income(chat_id, driver)
         return
 
     if norm_cmd in ("бонус", "цель", "мой бонус", "моя цель"):
@@ -4126,6 +4606,19 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             return
         await send_ephemeral_text(chat_id, "Выбери поле для изменения:", reply_markup=kb_edit_field_choice(data), ttl_sec=15)
         return
+
+    if step is None and (raw_text or file_id) and is_amo_help_session_active(chat_id):
+        if await relay_courier_message_to_amocrm(
+            chat_id, raw_text, contact_name, has_attachment=bool(file_id)
+        ):
+            open_amo_help_session(chat_id)
+            await send_ephemeral_text(
+                chat_id,
+                "✅ Передали менеджеру. Ответ придёт сюда.",
+                reply_markup=kb_start_menu(is_admin=is_adm),
+                ttl_sec=8,
+            )
+            return
 
     if step is None and raw_text:
         ai_ans = await answer_simple_question_with_ai(raw_text)
