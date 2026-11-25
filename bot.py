@@ -446,7 +446,6 @@ def _reply_kb(
 def kb_start_menu(is_admin: bool = False) -> dict[str, Any]:
     rows: list[list[str | dict[str, Any]]] = [
         ["🚀 Подключиться", "✅ Уже курьер"],
-        ["📚 Обучение", "💬 Чат курьеров"],
         ["❓ Помощь"],
     ]
     if is_admin:
@@ -3923,7 +3922,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     save_user_session(chat_id, username=tg_username, full_name=contact_name)
     norm_cmd = normalize_choice_text(raw_text)
 
-    if norm_cmd in ("обучение", "группа обучения"):
+    if norm_cmd in ("обучение", "группа обучения") and get_user_record(chat_id).get("phone"):
         await tg_send_text(
             chat_id,
             "📚 Группа для обучения\n\n"
@@ -3934,7 +3933,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         )
         return
 
-    if norm_cmd in ("чат курьеров", "чат"):
+    if norm_cmd in ("чат курьеров", "чат") and get_user_record(chat_id).get("phone"):
         await tg_send_text(
             chat_id,
             "💬 Чат курьеров Лунапарка\n\n"
