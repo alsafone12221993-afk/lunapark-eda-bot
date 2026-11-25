@@ -337,6 +337,7 @@ PENDING_DEMANDS_FILE = "pending_demands.json"
 AUTH_GUARD_FILE = "auth_guard.json"
 PHONE_OWNERS_FILE = "phone_owners.json"
 BOT_ACTIVITY_FILE = "bot_user_activity.json"
+BROADCAST_HISTORY_FILE = "broadcast_history.json"
 
 FLEET_API_URL = "https://fleet-api.taxi.yandex.net"
 
@@ -365,6 +366,7 @@ DRIVERS_TTL_SEC = 3600
 PAGE_PAUSE_SEC = 0.5
 
 DRIVER_STATS_CACHE: dict[str, dict[str, Any]] = {}
+ADMIN_ORDERS_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
 DRIVER_STATS_TTL_SEC = 180
 
 DRIVER_FINES_CACHE: dict[str, dict[str, Any]] = {}
@@ -451,21 +453,54 @@ def kb_start_menu(is_admin: bool = False) -> dict[str, Any]:
         ["❓ Помощь"],
     ]
     if is_admin:
-        rows.append(["🛠 Админка", "⏱ Заказы в час"])
+        rows.append(["🛠 Админка"])
     return _reply_kb(rows)
 
 
 def kb_admin_menu(is_superadmin: bool = False) -> dict[str, Any]:
     rows: list[list[str | dict[str, Any]]] = [
-        ["📊 Сводка за период", "⏱ Заказы в час"],
+        ["📊 Сводка за период", "📦 Заказы"],
         ["🗓 Период", "📣 Массовая рассылка"],
         ["🔥 Проверить спрос"],
+        ["👥 Пользователи бота"],
     ]
-    rows.append(["👥 Пользователи бота"])
     if is_superadmin:
         rows.append(["👥 Админы", "🔓 Сбросить привязку"])
     rows.append(["⬅️ В начало"])
     return _reply_kb(rows)
+
+
+def kb_bot_users_menu() -> dict[str, Any]:
+    return _reply_kb([
+        ["🚀 Нажали подключиться", "✅ Нажали уже курьер"],
+        ["📊 Нажали статистику", "💰 Нажали доход"],
+        ["⚖️ Нажали корректировки", "🎁 Нажали бонус"],
+        ["📚 Нажали обучение", "💬 Нажали чат"],
+        ["❓ Нажали помощь"],
+        ["🟢 Активные 24 часа", "👤 Все пользователи"],
+        ["🟡 Неактивные 7+ дней", "🔴 Неактивные 30+ дней"],
+        ["📨 Получили рассылку", "⛔ Заблокировали бота"],
+        ["🕘 Последние действия", "🧾 История рассылок"],
+        ["⬅️ В админку"],
+    ])
+
+
+def kb_broadcast_confirm(token: str = "") -> dict[str, Any]:
+    # Reply keyboard is received as an ordinary message and also works when Wazzup is the inbound transport.
+    return _reply_kb([
+        ["✅ Подтвердить отправку"],
+        ["❌ Отменить рассылку"],
+    ])
+
+
+def kb_demand_confirm(city_key: str) -> dict[str, Any]:
+    city = _normalize_city_key(city_key) or city_key
+    short_city = "СПб" if city == "Санкт-Петербург" else ("МСК" if city == "Москва" else city)
+    return _reply_kb([
+        [f"✅ Согласовать спрос {short_city}"],
+        [f"⛔ Отклонить спрос {short_city}"],
+        ["⬅️ В админку"],
+    ])
 
 
 def kb_cancel_questions_choice() -> dict[str, Any]:
@@ -533,7 +568,7 @@ def kb_courier_cabinet(show_bonus: bool = True) -> dict[str, Any]:
             ["📊 Моя статистика", "🎁 Бонус"],
             ["💰 Доход в парке", "⚖️ Корректировки"],
             ["📚 Обучение", "💬 Чат курьеров"],
-            ["❓ Помощь", "🔄 Сменить номер"],
+            ["❓ Помощь"],
             ["⬅️ В начало"],
         ]
     else:
@@ -541,7 +576,7 @@ def kb_courier_cabinet(show_bonus: bool = True) -> dict[str, Any]:
             ["📊 Моя статистика", "💰 Доход в парке"],
             ["⚖️ Корректировки", "📚 Обучение"],
             ["💬 Чат курьеров", "❓ Помощь"],
-            ["🔄 Сменить номер", "⬅️ В начало"],
+            ["⬅️ В начало"],
         ]
     return _reply_kb(rows)
 
@@ -2452,7 +2487,7 @@ async def _find_all_profiles_by_phone(
 
 
 def _parse_order_dt(order: dict[str, Any]) -> Optional[datetime]:
-    for key in ("booked_at", "ended_at", "created_at", "updated_at"):
+    for key in ("ended_at", "created_at", "booked_at", "updated_at"):
         raw = order.get(key)
         if not raw:
             continue
@@ -2846,7 +2881,123 @@ async def get_live_park_activity_stats() -> dict[str, int]:
     }
 
 
-def track_bot_user_activity(chat_id: int | str, username: str = "", full_name: str = "", action: str = "message") -> None:
+def _activity_event(rec: dict[str, Any], action: str, label: str, now_iso: str) -> None:
+    events = rec.get("events") if isinstance(rec.get("events"), list) else []
+    events.append({"at": now_iso, "action": action, "label": label[:70]})
+    rec["events"] = events[-80:]
+
+
+def track_bot_user_activity(
+    chat_id: int | str,
+    username: str = "",
+    full_name: str = "",
+    action: str = "message",
+    button_text: str = "",
+) -> None:
+    data = _read_json(BOT_ACTIVITY_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    key = str(chat_id)
+    existed = isinstance(data.get(key), dict)
+    rec = data.get(key) if existed else {}
+    now = datetime.now(timezone.utc).isoformat()
+    rec.setdefault("first_seen_at", now)
+    rec["last_seen_at"] = now
+    rec["username"] = username.lstrip("@").strip() or rec.get("username", "")
+    rec["full_name"] = full_name.strip() or rec.get("full_name", "")
+    rec["message_count"] = int(rec.get("message_count") or 0) + 1
+    rec["chat_status"] = "active"
+    rec["is_blocked"] = False
+    if action == "start":
+        rec["start_count"] = int(rec.get("start_count") or 0) + 1
+        rec["last_start_at"] = now
+        if not existed:
+            rec["first_start_at"] = now
+    elif action == "connect":
+        rec["connect_clicks"] = int(rec.get("connect_clicks") or 0) + 1
+        rec["last_connect_at"] = now
+    elif action == "already_courier":
+        rec["already_courier_clicks"] = int(rec.get("already_courier_clicks") or 0) + 1
+        rec["last_already_courier_at"] = now
+
+    norm = normalize_choice_text(button_text)
+    known_buttons = {
+        "подключиться": "🚀 Подключиться",
+        "подключиться к парку": "🚀 Подключиться",
+        "регистрация": "🚀 Подключиться",
+        "стать курьером": "🚀 Подключиться",
+        "уже курьер": "✅ Уже курьер",
+        "уже курьер парка": "✅ Уже курьер",
+        "кабинет": "✅ Уже курьер",
+        "мой кабинет": "✅ Уже курьер",
+        "помощь": "❓ Помощь",
+        "нужна помощь": "❓ Помощь",
+        "поддержка": "❓ Помощь",
+        "моя статистика": "📊 Моя статистика",
+        "статистика": "📊 Моя статистика",
+        "доход в парке": "💰 Доход в парке",
+        "мой доход": "💰 Доход в парке",
+        "доход": "💰 Доход в парке",
+        "корректировки": "⚖️ Корректировки",
+        "обучение": "📚 Обучение",
+        "группа обучения": "📚 Обучение",
+        "чат курьеров": "💬 Чат курьеров",
+        "чат": "💬 Чат курьеров",
+        "бонус": "🎁 Бонус",
+        "цель": "🎁 Бонус",
+        "отмена": "❌ Отмена",
+        "отменить": "❌ Отмена",
+        "отменить рассылку": "❌ Отменить рассылку",
+        "подтвердить отправку": "✅ Подтвердить отправку",
+        "согласовать спрос спб": "✅ Согласовать спрос СПб",
+        "согласовать спрос мск": "✅ Согласовать спрос МСК",
+        "отклонить спрос спб": "⛔ Отклонить спрос СПб",
+        "отклонить спрос мск": "⛔ Отклонить спрос МСК",
+        "пеший / вело": "🚶 Пеший / Вело",
+        "мото": "🛵 Мото",
+        "авто": "🚗 Авто",
+        "грузовой": "🚚 Грузовой",
+        "да": "Да",
+        "нет": "Нет",
+        "исправить": "Исправить",
+        "изменить формат": "Изменить формат",
+        "изменить город": "Изменить город",
+        "изменить фио": "Изменить ФИО",
+        "изменить телефон": "Изменить телефон",
+        "изменить прописку": "Изменить прописку",
+        "назад к проверке": "Назад к проверке",
+        "отправить номер профиля": "📱 Отправить номер профиля",
+        "хочу ввести другой номер": "Хочу ввести другой номер",
+        "период": "🗓 Период",
+        "массовая рассылка": "📣 Массовая рассылка",
+        "проверить спрос": "🔥 Проверить спрос",
+        "пользователи бота": "👥 Пользователи бота",
+        "заказы": "📦 Заказы",
+        "сводка за период": "📊 Сводка за период",
+        "в начало": "⬅️ В начало",
+        "главное меню": "⬅️ В начало",
+        "старт": "⬅️ В начало",
+    }
+    if action == "start":
+        label = "/start — вход в бот"
+        event_action = "start"
+    elif norm in known_buttons:
+        label = known_buttons[norm]
+        event_action = "button"
+        button_counts = rec.get("button_counts") if isinstance(rec.get("button_counts"), dict) else {}
+        button_counts[label] = int(button_counts.get(label) or 0) + 1
+        rec["button_counts"] = button_counts
+    else:
+        label = "Сообщение / ввод"
+        event_action = "message"
+    rec["last_action"] = label
+    rec["last_action_at"] = now
+    _activity_event(rec, event_action, label, now)
+    data[key] = rec
+    _write_json(BOT_ACTIVITY_FILE, data)
+
+
+def track_bot_user_membership(chat_id: int | str, new_status: str, username: str = "", full_name: str = "") -> None:
     data = _read_json(BOT_ACTIVITY_FILE, {})
     if not isinstance(data, dict):
         data = {}
@@ -2854,56 +3005,502 @@ def track_bot_user_activity(chat_id: int | str, username: str = "", full_name: s
     rec = data.get(key) if isinstance(data.get(key), dict) else {}
     now = datetime.now(timezone.utc).isoformat()
     rec.setdefault("first_seen_at", now)
-    rec["last_seen_at"] = now
-    rec["username"] = username.lstrip("@").strip() or rec.get("username", "")
-    rec["full_name"] = full_name.strip() or rec.get("full_name", "")
-    rec["message_count"] = int(rec.get("message_count") or 0) + 1
-    if action == "start":
-        rec["start_count"] = int(rec.get("start_count") or 0) + 1
-    elif action == "connect":
-        rec["connect_clicks"] = int(rec.get("connect_clicks") or 0) + 1
-        rec["last_connect_at"] = now
-    elif action == "already_courier":
-        rec["already_courier_clicks"] = int(rec.get("already_courier_clicks") or 0) + 1
-        rec["last_already_courier_at"] = now
+    if username:
+        rec["username"] = username.lstrip("@").strip()
+    if full_name:
+        rec["full_name"] = full_name.strip()
+    status = (new_status or "").lower()
+    if status in ("kicked", "left"):
+        rec["chat_status"] = "blocked"
+        rec["is_blocked"] = True
+        rec["blocked_at"] = now
+        _activity_event(rec, "blocked", "🚫 Пользователь заблокировал бота", now)
+    elif status in ("member", "administrator"):
+        rec["chat_status"] = "active"
+        rec["is_blocked"] = False
+        rec["unblocked_at"] = now
+        _activity_event(rec, "unblocked", "✅ Пользователь снова доступен", now)
+    rec["last_membership_update_at"] = now
     data[key] = rec
     _write_json(BOT_ACTIVITY_FILE, data)
 
 
-def build_bot_users_admin_text() -> str:
+def _activity_and_users() -> tuple[dict[str, Any], dict[str, Any]]:
     activity = _read_json(BOT_ACTIVITY_FILE, {})
     users = _read_json(USERS_FILE, {})
-    if not isinstance(activity, dict): activity = {}
-    if not isinstance(users, dict): users = {}
+    return (activity if isinstance(activity, dict) else {}, users if isinstance(users, dict) else {})
+
+
+def _user_activity_rows() -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
+    activity, users = _activity_and_users()
+    all_ids = set(activity) | set(users)
+    result = []
+    for uid in all_ids:
+        a = activity.get(uid) if isinstance(activity.get(uid), dict) else {}
+        u = users.get(uid) if isinstance(users.get(uid), dict) else {}
+        merged = dict(a)
+        for key, value in u.items():
+            if value not in (None, ""):
+                merged.setdefault(key, value)
+        result.append((str(uid), merged, a))
+    result.sort(key=lambda row: str(row[1].get("last_seen_at") or row[1].get("registered_at") or ""), reverse=True)
+    return result
+
+
+def _fmt_activity_time(raw: Any) -> str:
+    if not raw:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return str(raw)[:25]
+
+
+def build_bot_users_admin_text() -> str:
+    rows = _user_activity_rows()
     now = datetime.now(timezone.utc)
-    parsed = []
-    connect_total = already_total = active24 = active7 = inactive30 = 0
-    for uid, rec in activity.items():
-        if not isinstance(rec, dict): continue
-        connect_total += int(rec.get("connect_clicks") or 0)
-        already_total += int(rec.get("already_courier_clicks") or 0)
-        raw = rec.get("last_seen_at") or rec.get("first_seen_at")
+    active24 = active7 = inactive7 = inactive30 = blocked = 0
+    connect_users = already_users = started_users = start_total = 0
+    connect_total = already_total = broadcast_received = broadcast_failed = 0
+    new7 = new30 = 0
+    button_totals: dict[str, int] = {}
+    for uid, rec, activity in rows:
+        raw = rec.get("last_seen_at") or rec.get("registered_at") or rec.get("first_seen_at")
+        age = None
         try:
             dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             age = now - dt.astimezone(timezone.utc)
             if age <= timedelta(hours=24): active24 += 1
             if age <= timedelta(days=7): active7 += 1
+            else: inactive7 += 1
             if age > timedelta(days=30): inactive30 += 1
-        except Exception: age = None
-        parsed.append((str(raw or ""), str(uid), rec, age))
-    parsed.sort(key=lambda x: x[0], reverse=True)
-    out = ["👥 АНАЛИТИКА ПОЛЬЗОВАТЕЛЕЙ БОТА", "", f"Всего пользователей: {len(activity)}", f"Активны за 24 часа: {active24}", f"Активны за 7 дней: {active7}", f"Неактивны более 30 дней: {inactive30}", f"Нажатий «🚀 Подключиться»: {connect_total}", f"Нажатий «✅ Уже курьер»: {already_total}", f"Пользователей с профилем/данными в базе: {len(users)}", "", "Последние пользователи (до 20):"]
-    for _, uid, rec, age in parsed[:20]:
-        name = str(rec.get("full_name") or "Пользователь").replace("\n", " ")[:40]
-        username = "@" + rec["username"] if rec.get("username") else "без username"
-        raw_last = rec.get("last_seen_at") or "—"
-        try: last = datetime.fromisoformat(str(raw_last).replace("Z", "+00:00")).astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M")
-        except Exception: last = str(raw_last)
-        status = "🟢 активен за 24ч" if age is not None and age <= timedelta(hours=24) else ("🟡 был за 7д" if age is not None and age <= timedelta(days=7) else "⚪ неактивен")
-        out.append(f"\n{name} · {username}\nID: {uid} · {status}\nПоследняя активность: {last}\nПодключиться: {int(rec.get('connect_clicks') or 0)} · Уже курьер: {int(rec.get('already_courier_clicks') or 0)}")
-    out += ["", "Примечание: Telegram не сообщает боту, что пользователь удалил чат или нажал «выйти». Поэтому неактивность определяется по дате последнего действия, а не как подтверждённый выход."]
-    return "\n".join(out)[:3900]
+        except Exception:
+            pass
+        first_raw = rec.get("first_seen_at") or rec.get("registered_at")
+        try:
+            first_dt = datetime.fromisoformat(str(first_raw).replace("Z", "+00:00"))
+            if first_dt.tzinfo is None:
+                first_dt = first_dt.replace(tzinfo=timezone.utc)
+            first_age = now - first_dt.astimezone(timezone.utc)
+            if first_age <= timedelta(days=7): new7 += 1
+            if first_age <= timedelta(days=30): new30 += 1
+        except Exception:
+            pass
+        if rec.get("is_blocked") or rec.get("chat_status") == "blocked": blocked += 1
+        if int(rec.get("connect_clicks") or 0) > 0: connect_users += 1
+        if int(rec.get("already_courier_clicks") or 0) > 0: already_users += 1
+        connect_total += int(rec.get("connect_clicks") or 0)
+        already_total += int(rec.get("already_courier_clicks") or 0)
+        start_total += int(rec.get("start_count") or 0)
+        if int(rec.get("start_count") or 0) > 0: started_users += 1
+        broadcast_received += int(rec.get("broadcast_received_count") or 0)
+        broadcast_failed += int(rec.get("broadcast_failed_count") or 0)
+        counts = rec.get("button_counts") if isinstance(rec.get("button_counts"), dict) else {}
+        for label, count in counts.items():
+            try:
+                button_totals[str(label)] = button_totals.get(str(label), 0) + int(count or 0)
+            except Exception:
+                continue
+    history = _read_json(BROADCAST_HISTORY_FILE, [])
+    if not isinstance(history, list): history = []
+    completed_campaigns = sum(1 for item in history if isinstance(item, dict) and item.get("status") == "sent")
+    top_buttons = sorted(button_totals.items(), key=lambda item: item[1], reverse=True)[:5]
+    out = [
+        "👥 АНАЛИТИКА ПОЛЬЗОВАТЕЛЕЙ БОТА", "",
+        f"👤 Всего пользователей в базе: {len(rows)}",
+        f"🚪 Заходили через /start: {started_users} чел. / {start_total} входов",
+        f"🆕 Новые за 7 дней / 30 дней: {new7} / {new30}",
+        f"🟢 Активны за 24 часа: {active24}",
+        f"📅 Активны за 7 дней: {active7}",
+        f"🟡 Неактивны более 7 дней: {inactive7}",
+        f"🔴 Неактивны более 30 дней: {inactive30}",
+        f"🚫 Заблокировали / недоступны: {blocked}",
+        f"🚀 Нажимали «Подключиться»: {connect_users} чел. / {connect_total} нажатий",
+        f"✅ Нажимали «Уже курьер»: {already_users} чел. / {already_total} нажатий",
+        f"📨 Доставлено рассылок: {broadcast_received} · Ошибок доставки: {broadcast_failed}",
+        f"📣 Завершённых рассылок: {completed_campaigns}",
+    ]
+    if top_buttons:
+        out.extend(["", "🏆 ТОП НАЖАТИЙ КНОПОК:"])
+        out.extend(f"• {label}: {count}" for label, count in top_buttons)
+    out.extend([
+        "",
+        "Открой категорию ниже, чтобы увидеть конкретных пользователей и их действия.",
+        "Блокировка фиксируется по событию Telegram или ошибке доставки 403; отсутствие активности само по себе не считается выходом.",
+    ])
+    return "\n".join(out)
+
+
+def build_bot_users_segment_text(segment: str) -> str:
+    rows = _user_activity_rows()
+    now = datetime.now(timezone.utc)
+    title_map = {
+        "connect": "🚀 ПОЛЬЗОВАТЕЛИ, НАЖАВШИЕ «ПОДКЛЮЧИТЬСЯ»",
+        "already": "✅ ПОЛЬЗОВАТЕЛИ, НАЖАВШИЕ «УЖЕ КУРЬЕР»",
+        "stats": "📊 ПОЛЬЗОВАТЕЛИ, ОТКРЫВАВШИЕ СТАТИСТИКУ",
+        "income": "💰 ПОЛЬЗОВАТЕЛИ, ОТКРЫВАВШИЕ РАЗДЕЛ ДОХОДА",
+        "adjustments": "⚖️ ПОЛЬЗОВАТЕЛИ, ОТКРЫВАВШИЕ КОРРЕКТИРОВКИ",
+        "bonus": "🎁 ПОЛЬЗОВАТЕЛИ, ОТКРЫВАВШИЕ БОНУС",
+        "training": "📚 ПОЛЬЗОВАТЕЛИ, ОТКРЫВАВШИЕ ОБУЧЕНИЕ",
+        "chat": "💬 ПОЛЬЗОВАТЕЛИ, ОТКРЫВАВШИЕ ЧАТ КУРЬЕРОВ",
+        "help": "❓ ПОЛЬЗОВАТЕЛИ, НАЖИМАВШИЕ ПОМОЩЬ",
+        "active": "🟢 АКТИВНЫЕ ЗА ПОСЛЕДНИЕ 24 ЧАСА",
+        "inactive7": "🟡 НЕАКТИВНЫЕ БОЛЕЕ 7 ДНЕЙ",
+        "inactive30": "🔴 НЕАКТИВНЫЕ БОЛЕЕ 30 ДНЕЙ",
+        "broadcast": "📨 ПОЛЬЗОВАТЕЛИ, ПОЛУЧАВШИЕ РАССЫЛКИ",
+        "blocked": "⛔ ПОЛЬЗОВАТЕЛИ, ЗАБЛОКИРОВАВШИЕ / НЕДОСТУПНЫЕ",
+        "all": "👥 ПОСЛЕДНИЕ ПОЛЬЗОВАТЕЛИ",
+    }
+    filtered = []
+    for uid, rec, activity in rows:
+        raw_last = rec.get("last_seen_at") or rec.get("registered_at") or rec.get("first_seen_at")
+        try:
+            dt = datetime.fromisoformat(str(raw_last).replace("Z", "+00:00"))
+            if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+            age = now - dt.astimezone(timezone.utc)
+        except Exception:
+            age = None
+        if segment == "connect" and int(rec.get("connect_clicks") or 0) <= 0: continue
+        if segment == "already" and int(rec.get("already_courier_clicks") or 0) <= 0: continue
+        segment_button = {
+            "stats": "📊 Моя статистика",
+            "income": "💰 Доход в парке",
+            "adjustments": "⚖️ Корректировки",
+            "bonus": "🎁 Бонус",
+            "training": "📚 Обучение",
+            "chat": "💬 Чат курьеров",
+            "help": "❓ Помощь",
+        }.get(segment)
+        if segment_button:
+            button_counts = rec.get("button_counts") if isinstance(rec.get("button_counts"), dict) else {}
+            if int(button_counts.get(segment_button) or 0) <= 0: continue
+        if segment == "active" and (age is None or age > timedelta(hours=24)): continue
+        if segment == "inactive7" and (age is None or age <= timedelta(days=7)): continue
+        if segment == "inactive30" and (age is None or age <= timedelta(days=30)): continue
+        if segment == "broadcast" and int(rec.get("broadcast_received_count") or 0) <= 0: continue
+        if segment == "blocked" and not (rec.get("is_blocked") or rec.get("chat_status") == "blocked" or int(rec.get("broadcast_failed_count") or 0) > 0): continue
+        filtered.append((uid, rec, activity, age))
+    out = [title_map.get(segment, "👥 ПОЛЬЗОВАТЕЛИ"), f"Всего: {len(filtered)}", ""]
+    if segment == "actions":
+        events = []
+        for uid, rec, activity in rows:
+            for event in activity.get("events", []) if isinstance(activity.get("events"), list) else []:
+                if isinstance(event, dict):
+                    events.append((str(event.get("at") or ""), uid, rec, event))
+        events.sort(key=lambda x: x[0], reverse=True)
+        out = ["🕘 ПОСЛЕДНИЕ ДЕЙСТВИЯ ПОЛЬЗОВАТЕЛЕЙ", f"Событий в журнале: {len(events)}", ""]
+        for at, uid, rec, event in events[:30]:
+            name = str(rec.get("full_name") or "Пользователь")[:28]
+            username = "@" + str(rec.get("username")) if rec.get("username") else "без username"
+            out.append(f"{_fmt_activity_time(at)} · {event.get('label') or event.get('action')}\n{name} ({username}) · ID {uid}")
+        return "\n\n".join(out)[:3900]
+    if segment == "history":
+        history = _read_json(BROADCAST_HISTORY_FILE, [])
+        if not isinstance(history, list): history = []
+        out = ["🧾 ИСТОРИЯ РАССЫЛОК", f"Кампаний в журнале: {len(history)}", ""]
+        for item in reversed(history[-20:]):
+            if not isinstance(item, dict): continue
+            status = str(item.get("status") or "неизвестно")
+            text_preview = str(item.get("text") or "").replace("\n", " ")[:100]
+            out.append(
+                f"{_fmt_activity_time(item.get('created_at'))} · {status}\n"
+                f"Аудитория: {item.get('audience_count', 0)} · Доставлено: {item.get('delivered', 0)} · Ошибок: {item.get('failed', 0)}\n"
+                f"{text_preview or '—'}"
+            )
+        return "\n\n".join(out)[:3900]
+    if not filtered:
+        return "\n".join(out + ["Подходящих пользователей пока нет."])
+    for uid, rec, activity, age in filtered[:12]:
+        name = str(rec.get("full_name") or "Пользователь").replace("\n", " ")[:36]
+        username = "@" + str(rec.get("username")) if rec.get("username") else "без username"
+        status = "🚫 заблокировал / недоступен" if (rec.get("is_blocked") or rec.get("chat_status") == "blocked") else (
+            "🟢 активен" if age is not None and age <= timedelta(hours=24) else "⚪ неактивен"
+        )
+        counts = rec.get("button_counts") if isinstance(rec.get("button_counts"), dict) else {}
+        top_clicks = sorted(
+            ((str(label), int(count or 0)) for label, count in counts.items()),
+            key=lambda item: item[1], reverse=True
+        )[:5]
+        clicks_text = ", ".join(f"{label} ×{count}" for label, count in top_clicks) if top_clicks else "пока нет зафиксированных нажатий"
+        out.append(
+            f"{name} · {username}\nID: {uid} · {status}\n"
+            f"Подключиться: {int(rec.get('connect_clicks') or 0)} · Уже курьер: {int(rec.get('already_courier_clicks') or 0)}\n"
+            f"Доставлено рассылок: {int(rec.get('broadcast_received_count') or 0)} · Ошибок: {int(rec.get('broadcast_failed_count') or 0)}\n"
+            f"Кнопки: {clicks_text}\n"
+            f"Последнее действие: {rec.get('last_action') or '—'} · {_fmt_activity_time(rec.get('last_action_at') or rec.get('last_seen_at') or rec.get('registered_at'))}"
+        )
+    if len(filtered) > 12:
+        out.append(f"\nПоказаны последние 12 из {len(filtered)} пользователей. В журнале действий можно посмотреть историю активности; для полного списка потребуется отдельная выгрузка.")
+    return "\n\n".join(out)[:3900]
+
+
+def _get_broadcast_history() -> list[dict[str, Any]]:
+    raw = _read_json(BROADCAST_HISTORY_FILE, [])
+    return raw if isinstance(raw, list) else []
+
+
+def _save_broadcast_history(history: list[dict[str, Any]]) -> None:
+    _write_json(BROADCAST_HISTORY_FILE, history[-100:])
+
+
+def _broadcast_targets() -> list[str]:
+    activity, users = _activity_and_users()
+    return sorted({str(uid) for uid in set(activity) | set(users) if str(uid).lstrip("-").isdigit() and not str(uid).startswith("-")})
+
+
+async def show_broadcast_preview(admin_chat_id: int | str, message_text: str) -> None:
+    clean_text = (message_text or "").strip()
+    if not clean_text:
+        clear_user_state(admin_chat_id)
+        await tg_send_text(admin_chat_id, "Текст рассылки пустой. Ничего не отправлено.", reply_markup=kb_admin_menu(is_superadmin_user(admin_chat_id, admin_chat_id)))
+        return
+    target_count = len(_broadcast_targets())
+    if target_count <= 0:
+        clear_user_state(admin_chat_id)
+        await tg_send_text(
+            admin_chat_id,
+            "⚠️ В базе пока нет пользователей, которым можно отправить рассылку. Ничего не отправлено.",
+            reply_markup=kb_admin_menu(is_superadmin_user(admin_chat_id, admin_chat_id)),
+        )
+        return
+    token = uuid.uuid4().hex[:12]
+    set_user_state(admin_chat_id, "admin_broadcast_preview", {
+        "token": token,
+        "text": clean_text,
+        "created_at": time.time(),
+        "audience_count": target_count,
+    })
+    preview_text = (
+        "📣 ПРЕДПРОСМОТР РАССЫЛКИ\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Получателей: {target_count}\n"
+        "📨 Канал: личные сообщения бота\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"{clean_text[:3000]}\n\n"
+        "⚠️ Сообщение ещё НЕ отправлено. Нажми «Подтвердить отправку» только после проверки."
+    )
+    await tg_send_text(admin_chat_id, preview_text, reply_markup=kb_broadcast_confirm(token))
+
+
+async def send_broadcast_campaign(
+    admin_chat_id: int | str,
+    message_text: str,
+    audience_ids: list[str] | None = None,
+    campaign_type: str = "manual",
+    campaign_id: str | None = None,
+) -> dict[str, Any]:
+    targets = list(dict.fromkeys(str(uid) for uid in (audience_ids if audience_ids is not None else _broadcast_targets())))
+    targets = [uid for uid in targets if uid.lstrip("-").isdigit() and not uid.startswith("-")]
+    cid = campaign_id or uuid.uuid4().hex[:12]
+    created_at = datetime.now(timezone.utc).isoformat()
+    campaign = {
+        "id": cid,
+        "type": campaign_type,
+        "status": "sending",
+        "created_at": created_at,
+        "admin_id": str(admin_chat_id),
+        "text": (message_text or "")[:3000],
+        "audience_count": len(targets),
+        "delivered": 0,
+        "failed": 0,
+        "blocked": 0,
+    }
+    history = _get_broadcast_history()
+    history.append(campaign)
+    _save_broadcast_history(history)
+
+    activity, _users = _activity_and_users()
+    delivered = failed = blocked = 0
+    async with aiohttp.ClientSession() as session:
+        for idx, uid in enumerate(targets, 1):
+            result: dict[str, Any] = {}
+            try:
+                result = await tg_api(session, "sendMessage", {"chat_id": uid, "text": message_text})
+                if not result.get("ok") and int(result.get("error_code") or 0) == 429:
+                    retry_after = int((result.get("parameters") or {}).get("retry_after") or 2)
+                    await asyncio.sleep(min(max(retry_after, 1), 30) + 0.2)
+                    result = await tg_api(session, "sendMessage", {"chat_id": uid, "text": message_text})
+            except Exception as exc:
+                result = {"ok": False, "description": str(exc)}
+
+            rec = activity.get(uid) if isinstance(activity.get(uid), dict) else {}
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if result.get("ok"):
+                delivered += 1
+                rec["broadcast_received_count"] = int(rec.get("broadcast_received_count") or 0) + 1
+                rec["broadcast_last_at"] = now_iso
+                rec["broadcast_last_campaign_id"] = cid
+                _activity_event(rec, "broadcast_received", f"📨 Получил рассылку: {cid}", now_iso)
+            else:
+                failed += 1
+                rec["broadcast_failed_count"] = int(rec.get("broadcast_failed_count") or 0) + 1
+                rec["broadcast_last_error"] = str(result.get("description") or result.get("error") or "ошибка доставки")[:180]
+                rec["broadcast_last_failed_at"] = now_iso
+                error_text = str(result.get("description") or "").lower()
+                if int(result.get("error_code") or 0) == 403 and ("blocked" in error_text or "deactivated" in error_text):
+                    blocked += 1
+                    rec["is_blocked"] = True
+                    rec["chat_status"] = "blocked"
+                    rec["blocked_at"] = now_iso
+                    _activity_event(rec, "blocked", "🚫 Доставка не удалась: бот заблокирован или аккаунт недоступен", now_iso)
+            activity[uid] = rec
+            if idx % 25 == 0:
+                _write_json(BOT_ACTIVITY_FILE, activity)
+            await asyncio.sleep(0.05)
+    _write_json(BOT_ACTIVITY_FILE, activity)
+
+    campaign["status"] = "sent"
+    campaign["finished_at"] = datetime.now(timezone.utc).isoformat()
+    campaign["delivered"] = delivered
+    campaign["failed"] = failed
+    campaign["blocked"] = blocked
+    history = _get_broadcast_history()
+    for item in reversed(history):
+        if isinstance(item, dict) and item.get("id") == cid:
+            item.update(campaign)
+            break
+    _save_broadcast_history(history)
+    return {"id": cid, "audience": len(targets), "delivered": delivered, "failed": failed, "blocked": blocked}
+
+
+def record_cancelled_broadcast(admin_chat_id: int | str, text: str, audience_count: int, campaign_id: str = "") -> None:
+    history = _get_broadcast_history()
+    history.append({
+        "id": campaign_id or uuid.uuid4().hex[:12],
+        "type": "manual",
+        "status": "cancelled",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "admin_id": str(admin_chat_id),
+        "text": (text or "")[:3000],
+        "audience_count": int(audience_count),
+        "delivered": 0,
+        "failed": 0,
+        "blocked": 0,
+    })
+    _save_broadcast_history(history)
+
+
+async def answer_callback_query(callback_id: str, text: str = "", show_alert: bool = False) -> None:
+    if not callback_id or not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            await tg_api(session, "answerCallbackQuery", {
+                "callback_query_id": callback_id,
+                "text": text[:180] if text else "",
+                "show_alert": bool(show_alert),
+            })
+    except Exception:
+        logger.exception("Не удалось ответить на callback query")
+
+
+async def handle_telegram_callback(update: dict[str, Any]) -> None:
+    query = update.get("callback_query") or {}
+    callback_id = str(query.get("id") or "")
+    user = query.get("from") or {}
+    sender_id = user.get("id")
+    message = query.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    data = str(query.get("data") or "")
+    if not sender_id or not chat_id:
+        await answer_callback_query(callback_id, "Не удалось определить администратора.", True)
+        return
+    if not is_admin_user(sender_id, chat_id):
+        await answer_callback_query(callback_id, "Нет доступа.", True)
+        return
+
+    if data.startswith("broadcast_confirm:") or data.startswith("broadcast_cancel:"):
+        action, token = data.split(":", 1)
+        state = get_user_state(chat_id)
+        state_data = state.get("data") if isinstance(state.get("data"), dict) else {}
+        if state.get("step") != "admin_broadcast_preview" or state_data.get("token") != token:
+            await answer_callback_query(callback_id, "Черновик не найден или уже обработан.", True)
+            return
+        text_to_send = str(state_data.get("text") or "")
+        age = time.time() - float(state_data.get("created_at") or 0)
+        if age > 1800:
+            clear_user_state(chat_id)
+            await answer_callback_query(callback_id, "Предпросмотр устарел. Создай новую рассылку.", True)
+            await tg_send_text(chat_id, "Предпросмотр рассылки истёк. Ничего не отправлено.", reply_markup=kb_admin_menu(is_superadmin_user(sender_id, chat_id)))
+            return
+        audience_count = int(state_data.get("audience_count") or 0)
+        clear_user_state(chat_id)
+        if action == "broadcast_cancel":
+            record_cancelled_broadcast(chat_id, text_to_send, audience_count, token)
+            await answer_callback_query(callback_id, "Рассылка отменена. Пользователям ничего не отправлено.")
+            if message_id:
+                async with aiohttp.ClientSession() as session:
+                    await tg_api(session, "editMessageText", {
+                        "chat_id": chat_id, "message_id": message_id,
+                        "text": "❌ РАССЫЛКА ОТМЕНЕНА\n\nПользователям ничего не отправлено. Черновик сохранён в истории рассылок.",
+                        "reply_markup": {"inline_keyboard": []},
+                    })
+            await tg_send_text(chat_id, "Возвращаю в админку.", reply_markup=kb_admin_menu(is_superadmin_user(sender_id, chat_id)))
+            return
+        await answer_callback_query(callback_id, "Подтверждение принято. Начинаю отправку.")
+        stats = await send_broadcast_campaign(chat_id, text_to_send)
+        final_text = (
+            "✅ РАССЫЛКА ЗАВЕРШЕНА\n\n"
+            f"👥 В аудитории: {stats['audience']}\n"
+            f"📨 Доставлено: {stats['delivered']}\n"
+            f"⚠️ Не доставлено: {stats['failed']}\n"
+            f"🚫 Заблокировано / аккаунт недоступен: {stats['blocked']}"
+        )
+        if message_id:
+            async with aiohttp.ClientSession() as session:
+                await tg_api(session, "editMessageText", {
+                    "chat_id": chat_id, "message_id": message_id,
+                    "text": final_text, "reply_markup": {"inline_keyboard": []},
+                })
+        await tg_send_text(chat_id, "Рассылка обработана. Подробности доступны в «Истории рассылок».", reply_markup=kb_admin_menu(is_superadmin_user(sender_id, chat_id)))
+        return
+
+    if data.startswith("demand_approve:") or data.startswith("demand_skip:"):
+        if not is_superadmin_user(sender_id, chat_id):
+            await answer_callback_query(callback_id, "Согласовать рассылку может только суперадмин.", True)
+            return
+        action, city_key = data.split(":", 1)
+        pending = pop_pending_demand(city_key)
+        if not pending:
+            await answer_callback_query(callback_id, "Запрос уже обработан или устарел.", True)
+            return
+        city = str(pending.get("city") or city_key)
+        if action == "demand_skip":
+            await answer_callback_query(callback_id, "Уведомление отклонено.")
+            if message_id:
+                async with aiohttp.ClientSession() as session:
+                    await tg_api(session, "editMessageText", {
+                        "chat_id": chat_id, "message_id": message_id,
+                        "text": f"⛔ РАССЫЛКА ПО ГОРОДУ {city.upper()} ОТКЛОНЕНА\n\nКурьерам ничего не отправлено.",
+                        "reply_markup": {"inline_keyboard": []},
+                    })
+            return
+        await answer_callback_query(callback_id, f"Согласовано: {city}. Отправляю.")
+        recipients = find_users_by_city(city)
+        msg = f"🔥 В городе {city} сейчас повышенный спрос на курьеров. Заказы — от {int(pending.get('rate') or DEMAND_RATE_RUB_PER_HOUR)} ₽/час. Выходи на линию!"
+        stats = await send_broadcast_campaign(
+            chat_id, msg, audience_ids=recipients, campaign_type="demand", campaign_id=f"demand-{city_key}-{uuid.uuid4().hex[:6]}"
+        )
+        if message_id:
+            async with aiohttp.ClientSession() as session:
+                await tg_api(session, "editMessageText", {
+                    "chat_id": chat_id, "message_id": message_id,
+                    "text": (
+                        f"✅ УВЕДОМЛЕНИЕ ПО ГОРОДУ {city.upper()} ОТПРАВЛЕНО\n\n"
+                        f"👥 Получателей: {stats['audience']}\n📨 Доставлено: {stats['delivered']}\n⚠️ Ошибок: {stats['failed']}"
+                    ),
+                    "reply_markup": {"inline_keyboard": []},
+                })
+        return
+
+    await answer_callback_query(callback_id, "Кнопка уже неактуальна.")
 
 
 async def build_admin_summary_text(period_days: int) -> str:
@@ -2975,85 +3572,131 @@ async def build_admin_summary_text(period_days: int) -> str:
     )
 
 
-async def build_orders_per_hour_spb_msk_text() -> str:
-    now = datetime.now(timezone.utc)
-    hour_ago = now - timedelta(hours=1)
-    day_ago = now - timedelta(days=1)
+async def _fetch_park_orders_window(
+    session: aiohttp.ClientSession,
+    park: dict[str, str],
+    dt_from: datetime,
+    dt_to: datetime,
+    date_field: str = "ended_at",
+    completed_only: bool = True,
+) -> list[dict[str, Any]]:
+    orders: list[dict[str, Any]] = []
+    cursor: str | None = None
+    for _ in range(100):
+        order_query: dict[str, Any] = {
+            date_field: {
+                "from": dt_from.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "to": dt_to.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+        }
+        if completed_only:
+            order_query["statuses"] = ["complete"]
+        payload: dict[str, Any] = {
+            "query": {"park": {"id": park["park_id"], "order": order_query}},
+            "limit": 500,
+        }
+        if cursor:
+            payload["cursor"] = cursor
+        data = await _post_fleet_with_retry(session, park, "/v1/parks/orders/list", payload)
+        batch = data.get("orders") or []
+        if not isinstance(batch, list):
+            raise RuntimeError("Fleet API вернул некорректный список заказов")
+        orders.extend(item for item in batch if isinstance(item, dict))
+        next_cursor = str(data.get("cursor") or "").strip()
+        if not batch or not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+    else:
+        raise RuntimeError("Fleet API: превышен предел пагинации (100 страниц); полный счётчик не рассчитан")
+    return orders
 
-    city_orders: dict[str, list[str]] = {"СПб": [], "МСК": []}
-    city_counts: dict[str, int] = {"СПб": 0, "МСК": 0}
 
-    try:
+async def build_orders_admin_text(force_refresh: bool = False) -> str:
+    now_mono = time.monotonic()
+    cached = ADMIN_ORDERS_CACHE.get("data")
+    if not force_refresh and cached and now_mono - float(ADMIN_ORDERS_CACHE.get("ts") or 0) < 60:
+        data = cached
+    else:
+        now = datetime.now(timezone.utc)
+        cutoff_hour = now - timedelta(hours=1)
+        cutoff_week = now - timedelta(days=7)
+        cutoff_month = now - timedelta(days=30)
+        totals = {"hour": 0, "week": 0, "month": 0}
+        errors: list[str] = []
+        parks_ok = 0
         async with aiohttp.ClientSession() as session:
             for park in PARKS_CONFIG:
-                drivers = await get_cached_drivers(session, park, force_refresh=False)
-                for item in drivers[:40]:
-                    if not isinstance(item, dict):
-                        continue
-                    prof = item.get("driver_profile") or {}
-                    did = str(prof.get("id") or "")
-                    dcity = str(prof.get("city") or "").lower()
-                    tag = "СПб" if ("петерб" in dcity or "спб" in dcity or "питер" in dcity) else (
-                        "МСК" if ("моск" in dcity or "мск" in dcity) else ""
+                try:
+                    orders = await _fetch_park_orders_window(
+                        session, park, cutoff_month, now, date_field="ended_at", completed_only=True
                     )
-                    if not tag or not did:
-                        continue
-                    try:
-                        odata = await _post_fleet_with_retry(
-                            session,
-                            park,
-                            "/v1/parks/orders/list",
-                            {
-                                "query": {
-                                    "park": {
-                                        "id": park["park_id"],
-                                        "driver_profile": {"id": did},
-                                        "order": {
-                                            "booked_at": {
-                                                "from": day_ago.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                                "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                            }
-                                        },
-                                    }
-                                },
-                                "limit": 20,
-                            },
-                        )
-                        for o in odata.get("orders", []) or []:
-                            if not isinstance(o, dict):
-                                continue
-                            oid = str(o.get("id") or "—")[:8]
-                            odt = _parse_order_dt(o)
-                            price = _safe_float(o.get("price") or o.get("driver_income") or 0)
-                            if odt and odt >= hour_ago:
-                                city_counts[tag] += 1
-                            if len(city_orders[tag]) < 6:
-                                p_txt = f"{price:.0f} ₽" if price > 0 else "заказ"
-                                city_orders[tag].append(f"#{oid} ({p_txt})")
-                    except Exception:
-                        continue
-    except Exception as exc:
-        logger.warning("Ошибка выгрузки заказов в час по СПб/МСК: %s", exc)
-
-    default_samples = {
-        "СПб": ["#SPB-101 (820 ₽/ч)", "#SPB-102 (850 ₽/ч)", "#SPB-103 (810 ₽/ч)", "#SPB-104 (890 ₽/ч)", "#SPB-105 (840 ₽/ч)"],
-        "МСК": ["#MSK-201 (860 ₽/ч)", "#MSK-202 (910 ₽/ч)", "#MSK-203 (830 ₽/ч)", "#MSK-204 (880 ₽/ч)", "#MSK-205 (850 ₽/ч)"],
-    }
-
-    lines = ["⏱ Заказы в час (СПб и МСК)\n"]
-    for tag in ("СПб", "МСК"):
-        samples = list(city_orders[tag])
-        idx = 1
-        while len(samples) < 5:
-            fallback_item = default_samples[tag][(idx - 1) % len(default_samples[tag])]
-            samples.append(f"{fallback_item} [слот {idx}]")
-            idx += 1
-        lines.append(f"📍 {tag} (за последний час: {city_counts[tag]} | примеров в выгрузке: {len(samples)}):")
-        for s in samples[:6]:
-            lines.append(f"  • {s}")
+                    parks_ok += 1
+                    seen_ids: set[str] = set()
+                    for order in orders:
+                        order_id = str(order.get("id") or "")
+                        if order_id and order_id in seen_ids:
+                            continue
+                        if order_id:
+                            seen_ids.add(order_id)
+                        if not _is_completed_order_status(str(order.get("status") or "complete")):
+                            continue
+                        raw_dt = order.get("ended_at")
+                        order_dt = None
+                        if raw_dt:
+                            try:
+                                order_dt = datetime.fromisoformat(str(raw_dt).replace("Z", "+00:00"))
+                                if order_dt.tzinfo is None:
+                                    order_dt = order_dt.replace(tzinfo=timezone.utc)
+                                order_dt = order_dt.astimezone(timezone.utc)
+                            except Exception:
+                                order_dt = None
+                        if order_dt is None:
+                            # Completed orders without ended_at are not attributed to a time window.
+                            continue
+                        if order_dt >= cutoff_month: totals["month"] += 1
+                        if order_dt >= cutoff_week: totals["week"] += 1
+                        if order_dt >= cutoff_hour: totals["hour"] += 1
+                except Exception as exc:
+                    logger.warning("Не удалось получить заказы парка %s: %s", park.get("name"), exc)
+                    errors.append(f"{park.get('name')}: {str(exc)[:180]}")
+        data = {
+            "totals": totals,
+            "errors": errors,
+            "parks_ok": parks_ok,
+            "parks_total": len(PARKS_CONFIG),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        ADMIN_ORDERS_CACHE["ts"] = now_mono
+        ADMIN_ORDERS_CACHE["data"] = data
+    totals = data["totals"]
+    if data.get("parks_ok", 0) > 0:
+        hour_value = str(totals["hour"])
+        week_value = str(totals["week"])
+        month_value = str(totals["month"])
+    else:
+        hour_value = week_value = month_value = "нет данных"
+    lines = [
+        "📦 ЗАКАЗЫ ВСЕХ КУРЬЕРОВ ЛУНАПАРКЕ",
+        "",
+        f"⏱ За последний час: {hour_value}",
+        f"📅 За последние 7 дней: {week_value}",
+        f"🗓 За последние 30 дней: {month_value}",
+        "",
+        "В расчёт входят выполненные заказы всех курьеров парка. Периоды скользящие, отсчёт от текущего момента.",
+        f"Обновлено: {_fmt_activity_time(data.get('updated_at'))} (МСК).",
+    ]
+    if data.get("errors"):
         lines.append("")
+        lines.append(f"⚠️ Данные получены по паркам: {data.get('parks_ok')}/{data.get('parks_total')}.")
+        lines.extend(f"• {item}" for item in data["errors"][:3])
+    elif not data.get("parks_ok"):
+        lines.extend(["", "⚠️ Данные из Fleet API не получены. Числа не подставляются и не заменяются тестовыми значениями."])
+    return "\n".join(lines)
 
-    return "\n".join(lines).strip()
+
+async def build_orders_per_hour_spb_msk_text() -> str:
+    # Backward-compatible alias for older admin commands.
+    return await build_orders_admin_text()
 
 
 def _normalize_city_key(city_raw: str) -> str:
@@ -3125,17 +3768,29 @@ def pop_pending_demand(city_name: str | None = None) -> dict[str, Any] | None:
 
 async def notify_superadmin_about_demand(city_name: str, rate_rub_hour: int = DEMAND_RATE_RUB_PER_HOUR) -> None:
     clean_city = _normalize_city_key(city_name) or city_name.strip()
+    city_key = clean_city.lower()
+    pending = _read_json(PENDING_DEMANDS_FILE, {})
+    if isinstance(pending, dict):
+        existing = pending.get(city_key)
+        if isinstance(existing, dict) and time.time() - float(existing.get("created_at") or 0) < 3600:
+            return
     recipients = find_users_by_city(clean_city)
+    if not recipients:
+        logger.info("Повышенный спрос %s: нет пользователей с сохранённым городом; уведомление не отправлено", clean_city)
+        return
     save_pending_demand(clean_city, rate_rub_hour)
-    text = (
-        f"🔥 Повышенный спрос в городе {clean_city}!\n"
-        f"Ставка: от {rate_rub_hour} ₽/час.\n"
-        f"Найдено пользователей в городе: {len(recipients)}.\n\n"
-        f"Отправляем точечное уведомление курьерам из города «{clean_city}»?\n"
-        f"• Подтвердить: /approve_demand {clean_city}\n"
-        f"• Отклонить: /skip_demand {clean_city}"
+    preview = (
+        f"🔥 ПОВЫШЕННЫЙ СПРОС\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📍 Город: {clean_city}\n"
+        f"💰 Ставка: от {rate_rub_hour} ₽/час\n"
+        f"👥 Получателей: {len(recipients)} курьеров\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"Предлагаемый текст уведомления:\n"
+        f"«🔥 В {clean_city} сейчас повышенный спрос на курьеров. Заказы — от {rate_rub_hour} ₽/час. Выходи на линию!»\n\n"
+        f"Отправка НЕ начнётся без твоего подтверждения."
     )
-    await tg_send_text(SUPERADMIN_ID, text)
+    await tg_send_text(SUPERADMIN_ID, preview, reply_markup=kb_demand_confirm(city_key))
 
 
 async def demand_monitor_worker() -> None:
@@ -3145,52 +3800,43 @@ async def demand_monitor_worker() -> None:
             now = datetime.now(timezone.utc)
             hour_ago = now - timedelta(hours=1)
             city_recent_count: dict[str, int] = defaultdict(int)
-
             async with aiohttp.ClientSession() as session:
                 for park in PARKS_CONFIG:
-                    drivers = await get_cached_drivers(session, park, force_refresh=False)
-                    for item in drivers[:25]:
-                        if not isinstance(item, dict):
+                    try:
+                        drivers = await get_cached_drivers(session, park, force_refresh=False)
+                        city_by_driver: dict[str, str] = {}
+                        for item in drivers:
+                            if not isinstance(item, dict):
+                                continue
+                            prof = item.get("driver_profile") or {}
+                            did = str(prof.get("id") or "").strip()
+                            city = _normalize_city_key(str(prof.get("city") or ""))
+                            if did and city in ("Санкт-Петербург", "Москва"):
+                                city_by_driver[did] = city
+                        if not city_by_driver:
                             continue
-                        prof = item.get("driver_profile") or {}
-                        did = str(prof.get("id") or "")
-                        dcity = _normalize_city_key(str(prof.get("city") or ""))
-                        if not did or not dcity:
-                            continue
-                        try:
-                            odata = await _post_fleet_with_retry(
-                                session,
-                                park,
-                                "/v1/parks/orders/list",
-                                {
-                                    "query": {
-                                        "park": {
-                                            "id": park["park_id"],
-                                            "driver_profile": {"id": did},
-                                            "order": {
-                                                "booked_at": {
-                                                    "from": hour_ago.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                                    "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                                }
-                                            },
-                                        }
-                                    },
-                                    "limit": 15,
-                                },
-                            )
-                            for o in odata.get("orders", []) or []:
-                                if isinstance(o, dict) and not _is_completed_order_status(str(o.get("status") or "")):
-                                    city_recent_count[dcity] += 1
-                        except Exception:
-                            continue
-
-            for city_name, cnt in city_recent_count.items():
-                if cnt >= 3:
+                        orders = await _fetch_park_orders_window(
+                            session, park, hour_ago, now, date_field="booked_at", completed_only=False
+                        )
+                        for order in orders:
+                            if not isinstance(order, dict):
+                                continue
+                            if _is_completed_order_status(str(order.get("status") or "")):
+                                continue
+                            prof = order.get("driver_profile") or {}
+                            did = str(prof.get("id") or order.get("driver_id") or "").strip()
+                            city = city_by_driver.get(did)
+                            if city:
+                                city_recent_count[city] += 1
+                    except Exception as exc:
+                        logger.warning("Проверка спроса в парке %s не удалась: %s", park.get("name"), exc)
+            for city_name in ("Санкт-Петербург", "Москва"):
+                if city_recent_count.get(city_name, 0) >= 3:
                     await notify_superadmin_about_demand(city_name, DEMAND_RATE_RUB_PER_HOUR)
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            logger.debug("Проверка спроса: %s", exc)
+            logger.warning("Проверка спроса: %s", exc)
         await asyncio.sleep(900)
 
 
@@ -3817,6 +4463,23 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     if not isinstance(update, dict):
         return
 
+    if isinstance(update.get("callback_query"), dict):
+        await handle_telegram_callback(update)
+        return
+
+    membership = update.get("my_chat_member")
+    if isinstance(membership, dict):
+        chat = membership.get("chat") or {}
+        if str(chat.get("type") or "") == "private" and chat.get("id"):
+            new_member = membership.get("new_chat_member") or {}
+            actor = membership.get("from") or {}
+            track_bot_user_membership(
+                chat.get("id"), str(new_member.get("status") or ""),
+                str(actor.get("username") or ""),
+                " ".join(x for x in [str(actor.get("first_name") or ""), str(actor.get("last_name") or "")] if x).strip(),
+            )
+        return
+
     message = update.get("message") or update.get("edited_message")
     if not isinstance(message, dict):
         return
@@ -3901,14 +4564,11 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             await send_ephemeral_text(chat_id, "Нет ожидающих подтверждения уведомлений по спросу.")
             return
         target_city = pending["city"]
-        rate_val = pending["rate"]
+        rate_val = int(pending.get("rate") or DEMAND_RATE_RUB_PER_HOUR)
         targets = find_users_by_city(target_city)
-        sent_cnt = 0
-        msg_demand = f"🔥 Сейчас заказы от {rate_val} ₽ в час в вашем городе ({target_city})! Выходи на слот!"
-        for uid in targets:
-            if await tg_send_text(uid, msg_demand):
-                sent_cnt += 1
-        await tg_send_text(chat_id, f"✅ Отправлено по городу {target_city}: {sent_cnt} пользователям.")
+        msg_demand = f"🔥 В городе {target_city} сейчас повышенный спрос на курьеров. Заказы — от {rate_val} ₽/час. Выходи на линию!"
+        stats = await send_broadcast_campaign(chat_id, msg_demand, audience_ids=targets, campaign_type="demand")
+        await tg_send_text(chat_id, f"✅ Отправлено по городу {target_city}. Доставлено: {stats['delivered']} из {stats['audience']}, ошибок: {stats['failed']}.")
         return
 
     if raw_text.startswith("/skip_demand") and is_super:
@@ -3968,24 +4628,33 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         if not b_text:
             await send_ephemeral_text(chat_id, "Напиши текст после /broadcast")
             return
-        users_db = _read_json(USERS_FILE, {})
-        all_uids = list(users_db.keys()) if isinstance(users_db, dict) else []
-        ok_cnt = 0
-        for uid in all_uids:
-            if await tg_send_text(uid, b_text):
-                ok_cnt += 1
-        await tg_send_text(chat_id, f"📣 Рассылка завершена. Доставлено: {ok_cnt} из {len(all_uids)}.", reply_markup=kb_admin_menu(is_super))
+        await show_broadcast_preview(chat_id, b_text)
         return
 
+    early_norm_cmd = normalize_choice_text(raw_text)
     active_courier_for_op = get_operator_active_courier(chat_id)
-    if active_courier_for_op and raw_text not in ("/start",) and not raw_text.startswith("/"):
+    current_admin_state = get_user_state(chat_id) if is_adm else {}
+    current_admin_step = str(current_admin_state.get("step") or "")
+    if (
+        active_courier_for_op
+        and raw_text not in ("/start",)
+        and not raw_text.startswith("/")
+        and not (is_adm and (current_admin_step.startswith("admin_") or early_norm_cmd in {
+            "админка", "сводка за период", "заказы", "заказы в час", "заказыв час", "период",
+            "массовая рассылка", "рассылка", "пользователи бота", "аналитика пользователей", "пользователи",
+            "проверить спрос", "спрос", "нажали подключиться", "нажали уже курьер", "активные 24 часа",
+            "все пользователи", "нажали статистику", "нажали доход", "нажали корректировки", "нажали бонус", "нажали обучение", "нажали чат", "нажали помощь",
+            "неактивные 7+ дней", "неактивные 30+ дней", "получили рассылку", "заблокировали бота", "последние действия",
+            "история рассылок", "в админку", "назад в админку",
+        }))
+    ):
         await _deliver_operator_message_to_courier(chat_id, active_courier_for_op, raw_text, file_id)
         return
 
     save_user_session(chat_id, username=tg_username, full_name=contact_name)
-    norm_cmd = normalize_choice_text(raw_text)
+    norm_cmd = early_norm_cmd
     action = "start" if raw_text == "/start" else ("connect" if norm_cmd in ("подключиться", "подключиться к парку", "регистрация", "стать курьером") else ("already_courier" if norm_cmd in ("уже курьер", "уже курьер парка", "кабинет", "мой кабинет", "сменить номер", "изменить номер аккаунта") else "message"))
-    track_bot_user_activity(chat_id, tg_username, contact_name, action)
+    track_bot_user_activity(chat_id, tg_username, contact_name, action, raw_text)
 
     if norm_cmd in ("обучение", "группа обучения") and get_user_record(chat_id).get("phone"):
         await tg_send_text(
@@ -4027,21 +4696,46 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         return
 
     if step == "admin_waiting_broadcast" and is_adm:
-        clear_user_state(chat_id)
-        if not raw_text:
-            await send_ephemeral_text(chat_id, "Рассылка отменена — текст пуст.", reply_markup=kb_admin_menu(is_super))
+        if norm_cmd in ("отмена", "отменить", "отменить рассылку", "cancel", "в начало", "главное меню", "старт", "start", "меню", "помощь", "нужна помощь"):
+            clear_user_state(chat_id)
+            record_cancelled_broadcast(chat_id, "", len(_broadcast_targets()))
+            await tg_send_text(chat_id, "❌ Создание рассылки отменено. Пользователям ничего не отправлено.", reply_markup=kb_admin_menu(is_super))
             return
-        users_db = _read_json(USERS_FILE, {})
-        all_uids = list(users_db.keys()) if isinstance(users_db, dict) else []
-        ok_cnt = 0
-        for uid in all_uids:
-            if await tg_send_text(uid, raw_text):
-                ok_cnt += 1
-        await tg_send_text(
-            chat_id,
-            f"📣 Рассылка отправлена: {ok_cnt} из {len(all_uids)} пользователей.",
-            reply_markup=kb_admin_menu(is_super),
-        )
+        if not raw_text:
+            await send_ephemeral_text(chat_id, "Пришли текст рассылки или нажми «❌ Отмена». Ничего не отправляется без подтверждения.", reply_markup=kb_step_with_help())
+            return
+        await show_broadcast_preview(chat_id, raw_text)
+        return
+
+    if step == "admin_broadcast_preview" and is_adm:
+        state_data = data if isinstance(data, dict) else {}
+        cancel_values = ("отмена", "отменить", "отменить рассылку", "cancel")
+        confirm_values = ("подтвердить отправку", "подтвердить рассылку", "отправить рассылку")
+        if norm_cmd in cancel_values:
+            record_cancelled_broadcast(chat_id, str(state_data.get("text") or ""), int(state_data.get("audience_count") or 0), str(state_data.get("token") or ""))
+            clear_user_state(chat_id)
+            await tg_send_text(chat_id, "❌ Рассылка отменена. Пользователям ничего не отправлено.", reply_markup=kb_admin_menu(is_super))
+            return
+        if norm_cmd in confirm_values:
+            age = time.time() - float(state_data.get("created_at") or 0)
+            if age > 1800:
+                clear_user_state(chat_id)
+                await tg_send_text(chat_id, "Предпросмотр устарел. Ничего не отправлено — создай рассылку заново.", reply_markup=kb_admin_menu(is_super))
+                return
+            text_to_send = str(state_data.get("text") or "").strip()
+            clear_user_state(chat_id)
+            stats = await send_broadcast_campaign(chat_id, text_to_send)
+            await tg_send_text(
+                chat_id,
+                "✅ РАССЫЛКА ЗАВЕРШЕНА\n\n"
+                f"👥 В аудитории: {stats['audience']}\n"
+                f"📨 Доставлено: {stats['delivered']}\n"
+                f"⚠️ Не доставлено: {stats['failed']}\n"
+                f"🚫 Заблокировали бота / аккаунт недоступен: {stats['blocked']}",
+                reply_markup=kb_admin_menu(is_super),
+            )
+            return
+        await send_ephemeral_text(chat_id, "Черновик ещё не отправлен. Нажми «✅ Подтвердить отправку» или «❌ Отменить рассылку».", reply_markup=kb_broadcast_confirm(str(state_data.get("token") or "")))
         return
 
     if step == "admin_waiting_unbind" and is_super:
@@ -4057,7 +4751,58 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         return
 
     if is_adm and norm_cmd in ("пользователи бота", "аналитика пользователей", "пользователи"):
-        await tg_send_text(chat_id, build_bot_users_admin_text(), reply_markup=kb_admin_menu(is_super))
+        await tg_send_text(chat_id, build_bot_users_admin_text(), reply_markup=kb_bot_users_menu())
+        return
+
+    if is_adm and norm_cmd in ("нажали подключиться", "нажали уже курьер", "нажали статистику", "нажали доход", "нажали корректировки", "нажали бонус", "нажали обучение", "нажали чат", "нажали помощь", "активные 24 часа", "все пользователи", "неактивные 7+ дней", "неактивные 30+ дней", "получили рассылку", "заблокировали бота", "последние действия", "история рассылок"):
+        segment = {
+            "нажали подключиться": "connect",
+            "нажали уже курьер": "already",
+            "нажали статистику": "stats",
+            "нажали доход": "income",
+            "нажали корректировки": "adjustments",
+            "нажали бонус": "bonus",
+            "нажали обучение": "training",
+            "нажали чат": "chat",
+            "нажали помощь": "help",
+            "активные 24 часа": "active",
+            "все пользователи": "all",
+            "неактивные 7+ дней": "inactive7",
+            "неактивные 30+ дней": "inactive30",
+            "получили рассылку": "broadcast",
+            "заблокировали бота": "blocked",
+            "последние действия": "actions",
+            "история рассылок": "history",
+        }[norm_cmd]
+        await tg_send_text(chat_id, build_bot_users_segment_text(segment), reply_markup=kb_bot_users_menu())
+        return
+
+    if is_super and norm_cmd in (
+        "согласовать спрос спб", "согласовать спрос мск",
+        "отклонить спрос спб", "отклонить спрос мск",
+    ):
+        city_key = "санкт-петербург" if norm_cmd.endswith("спб") else "москва"
+        pending = pop_pending_demand(city_key)
+        if not pending:
+            await send_ephemeral_text(chat_id, "Запрос по этому городу уже обработан или устарел.", reply_markup=kb_admin_menu(True))
+            return
+        city = str(pending.get("city") or city_key)
+        if norm_cmd.startswith("отклонить"):
+            await tg_send_text(chat_id, f"⛔ Уведомление по городу {city} отклонено. Курьерам ничего не отправлено.", reply_markup=kb_admin_menu(True))
+            return
+        targets = find_users_by_city(city)
+        rate = int(pending.get("rate") or DEMAND_RATE_RUB_PER_HOUR)
+        demand_text = f"🔥 В городе {city} сейчас повышенный спрос на курьеров. Заказы — от {rate} ₽/час. Выходи на линию!"
+        stats = await send_broadcast_campaign(chat_id, demand_text, audience_ids=targets, campaign_type="demand")
+        await tg_send_text(
+            chat_id,
+            f"✅ Уведомление по городу {city} обработано.\n👥 Получателей: {stats['audience']}\n📨 Доставлено: {stats['delivered']}\n⚠️ Ошибок: {stats['failed']}",
+            reply_markup=kb_admin_menu(True),
+        )
+        return
+
+    if is_adm and norm_cmd in ("в админку", "назад в админку"):
+        await tg_send_text(chat_id, "🛠 Админка", reply_markup=kb_admin_menu(is_super))
         return
 
     if is_adm and norm_cmd in ("админка", "сводка за период"):
@@ -4087,9 +4832,9 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         )
         return
 
-    if is_adm and norm_cmd in ("заказы в час", "заказыв час"):
-        await send_ephemeral_text(chat_id, "Собираю данные по СПб и МСК...", reply_markup=kb_admin_menu(is_super), ttl_sec=10)
-        txt = await build_orders_per_hour_spb_msk_text()
+    if is_adm and norm_cmd in ("заказы", "заказы в час", "заказыв час"):
+        await send_ephemeral_text(chat_id, "Собираю заказы всех курьеров из Fleet API...", reply_markup=kb_admin_menu(is_super), ttl_sec=10)
+        txt = await build_orders_admin_text(force_refresh=True)
         await tg_send_text(chat_id, txt, reply_markup=kb_admin_menu(is_super))
         return
 
@@ -5150,7 +5895,7 @@ async def polling_loop() -> None:
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                params: dict[str, Any] = {"timeout": 30}
+                params: dict[str, Any] = {"timeout": 30, "allowed_updates": json.dumps(["message", "edited_message", "callback_query", "my_chat_member"])}
                 if offset is not None:
                     params["offset"] = offset
                 async with session.get(
@@ -5250,7 +5995,7 @@ async def on_startup(app: web.Application) -> None:
         return
     async with aiohttp.ClientSession() as session:
         if TELEGRAM_WEBHOOK_URL:
-            wh_payload: dict[str, Any] = {"url": TELEGRAM_WEBHOOK_URL}
+            wh_payload: dict[str, Any] = {"url": TELEGRAM_WEBHOOK_URL, "allowed_updates": ["message", "edited_message", "callback_query", "my_chat_member"]}
             if TELEGRAM_WEBHOOK_SECRET:
                 wh_payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
             await tg_api(session, "setWebhook", wh_payload)
