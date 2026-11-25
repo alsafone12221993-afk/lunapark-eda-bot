@@ -347,8 +347,9 @@ GOAL_BONUS = 500
 LUNAPARK_STUDY_URL = os.getenv("LUNAPARK_STUDY_URL", "https://t.me/LUNAPARK_study").strip()
 LUNAPARK_CHAT_URL = os.getenv("LUNAPARK_CHAT_URL", "https://t.me/LUNAPARK_chat").strip()
 MSK_TZ = timezone(timedelta(hours=3))
-SUPPORT_CHAT_URL = os.getenv("SUPPORT_CHAT_URL", "https://t.me/@Lunapark_support_bot").strip()
-SUPPORT_CHAT_USERNAME = "@Lunapark_support_bot"
+SUPPORT_CHAT_URL = "https://t.me/LUNAPARK_DR"
+SUPPORT_CHAT_USERNAME = "@LUNAPARK_DR"
+CONNECT_PROFILE_URL = "https://t.me/Lunapark_support_bot"
 SUPPORT_PHONE_DISPLAY = "+7 (999) 515-70-42"
 INCOME_CACHE: dict[str, dict[str, Any]] = {}
 INCOME_TTL_SEC = 60
@@ -4195,11 +4196,15 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             await tg_send_text(bound_operator, msg_for_op)
 
     if norm_cmd in ("подключиться", "подключиться к парку", "регистрация", "стать курьером"):
-        set_user_state(chat_id, "reg_transport", {"return_to_confirm": False})
+        set_user_state(chat_id, "start", {})
         await tg_send_text(
             chat_id,
-            "Шаг 1. Как планируешь доставлять заказы? 🚀",
-            reply_markup=kb_transport_choice(),
+            "🍔 Хочешь начать доставлять заказы в Яндекс Еде вместе с Лунапарком?\n\n"
+            "Первый шаг — подключить профиль Яндекс Еды к нашему парку.\n\n"
+            "Перейди в бота поддержки и напиши, что хочешь подключиться к Лунапарку. "
+            "Специалист поможет оформить профиль и подскажет, что делать дальше.\n\n"
+            "👉 Нажми кнопку «Подключить профиль» ниже. До встречи на линии! 🚀",
+            reply_markup={"inline_keyboard": [[{"text": "🍔 Подключить профиль", "url": CONNECT_PROFILE_URL}]]},
         )
         return
 
