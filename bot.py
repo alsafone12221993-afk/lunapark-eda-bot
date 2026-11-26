@@ -836,8 +836,8 @@ async def _build_ai_courier_context(chat_id: int | str) -> str:
     if not phone:
         return ""
     owner = get_phone_bound_owner(phone)
-    if owner and str(owner) != str(chat_id):
-        logger.warning("ИИ: отклонена статистика из-за несовпадения владельца номера для chat_id=%s", chat_id)
+    if not owner or str(owner) != str(chat_id):
+        logger.warning("ИИ: отклонена статистика: номер не закреплён за текущим chat_id=%s", chat_id)
         return ""
     try:
         driver = await get_saved_profile_or_redirect(chat_id)
@@ -848,7 +848,7 @@ async def _build_ai_courier_context(chat_id: int | str) -> str:
         if normalize_phone(str(fresh_rec.get("phone") or "")) != normalize_phone(phone):
             return ""
         fresh_owner = get_phone_bound_owner(phone)
-        if fresh_owner and str(fresh_owner) != str(chat_id):
+        if not fresh_owner or str(fresh_owner) != str(chat_id):
             return ""
         park = get_park_by_id(str(driver["park_id"]))
         async with aiohttp.ClientSession() as session:
