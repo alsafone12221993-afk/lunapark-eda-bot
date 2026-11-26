@@ -38,15 +38,19 @@ WAZZUP_WEBHOOKS_API_URL = "https://api.wazzup24.com/v3/webhooks"
 AMOCRM_WEBHOOK_SECRET = os.getenv("AMOCRM_WEBHOOK_SECRET", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
-AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
-# AI_PROVIDER: "anthropic" (Claude) или "openai" (любой OpenAI-совместимый API).
-AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").strip().lower()
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "").strip()
+YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "").strip()
+# Совместимый API Yandex AI Studio. Если YANDEX_API_KEY задан, YandexGPT выбирается автоматически.
+AI_PROVIDER = os.getenv("AI_PROVIDER", "yandex" if YANDEX_API_KEY else "openai").strip().lower()
+AI_API_KEY = (YANDEX_API_KEY or os.getenv("AI_API_KEY", "")).strip()
 AI_BASE_URL = os.getenv(
     "AI_BASE_URL",
-    "https://api.anthropic.com/v1/messages" if AI_PROVIDER == "anthropic" else "https://api.openai.com/v1/chat/completions",
+    "https://ai.api.cloud.yandex.net/v1/chat/completions" if AI_PROVIDER == "yandex"
+    else ("https://api.anthropic.com/v1/messages" if AI_PROVIDER == "anthropic" else "https://api.openai.com/v1/chat/completions"),
 ).strip()
 AI_MODEL = (os.getenv("AI_MODEL", "").strip()
-            or ("claude-haiku-5-5" if AI_PROVIDER == "anthropic" else "gpt-4o-mini"))
+            or (f"gpt://{YANDEX_FOLDER_ID}/yandexgpt/latest" if AI_PROVIDER == "yandex" and YANDEX_FOLDER_ID
+                else ("claude-haiku-5-5" if AI_PROVIDER == "anthropic" else "gpt-4o-mini")))
 AI_MAX_ANSWERS_PER_HOUR = int(os.getenv("AI_MAX_ANSWERS_PER_HOUR", "8"))
 
 EPHEMERAL_TTL_SEC = int(os.getenv("EPHEMERAL_TTL_SEC", "25"))
@@ -772,8 +776,8 @@ def _ai_allowed(chat_id: int | str | None) -> bool:
     return True
 
 
-async def _call_ai(user_text: str) -> str | None:
-    """Один короткий запрос к ИИ (Anthropic или OpenAI-совместимый API)."""
+async def _call_ai(user_text: str, trusted_context: str = "") -> str | None:
+    """Один запрос к ИИ. trusted_context формируется только сервером из профиля текущего чата."""
     try:
         async with aiohttp.ClientSession() as session:
             if AI_PROVIDER == "anthropic":
@@ -786,7 +790,7 @@ async def _call_ai(user_text: str) -> str | None:
                     "model": AI_MODEL,
                     "max_tokens": 300,
                     "temperature": 0.3,
-                    "system": AI_SYSTEM_PROMPT,
+                    "system": AI_SYSTEM_PROMPT + ("\\n\\nДОВЕРЕННЫЕ ДАННЫЕ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ (используй только для ответа ему):\\n" + trusted_context if trusted_context else ""),
                     "messages": [{"role": "user", "content": user_text}],
                 }
             else:
@@ -796,7 +800,7 @@ async def _call_ai(user_text: str) -> str | None:
                     "temperature": 0.3,
                     "max_tokens": 300,
                     "messages": [
-                        {"role": "system", "content": AI_SYSTEM_PROMPT},
+                        {"role": "system", "content": AI_SYSTEM_PROMPT + ("\\n\\nДОВЕРЕННЫЕ ДАННЫЕ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ (используй только для ответа ему):\\n" + trusted_context if trusted_context else "")},
                         {"role": "user", "content": user_text},
                     ],
                 }
@@ -818,6 +822,58 @@ async def _call_ai(user_text: str) -> str | None:
         return None
 
 
+async def _build_ai_courier_context(chat_id: int | str) -> str:
+    """
+    Возвращает статистику только владельцу текущего Telegram-чата.
+    Никакие имена/телефоны не передаются модели. Чужой driver_id из текста пользователя
+    никогда не используется: профиль определяется исключительно по сохранённой привязке.
+    """
+    rec = get_user_record(chat_id)
+    phone = str(rec.get("phone") or "").strip()
+    if not phone:
+        return ""
+    owner = get_phone_bound_owner(phone)
+    if owner and str(owner) != str(chat_id):
+        logger.warning("ИИ: отклонена статистика из-за несовпадения владельца номера для chat_id=%s", chat_id)
+        return ""
+    try:
+        driver = await get_saved_profile_or_redirect(chat_id)
+        if not driver or not driver.get("id") or not driver.get("park_id"):
+            return ""
+        # Повторная проверка связи с номером перед обращением к Fleet API.
+        fresh_rec = get_user_record(chat_id)
+        if normalize_phone(str(fresh_rec.get("phone") or "")) != normalize_phone(phone):
+            return ""
+        fresh_owner = get_phone_bound_owner(phone)
+        if fresh_owner and str(fresh_owner) != str(chat_id):
+            return ""
+        park = get_park_by_id(str(driver["park_id"]))
+        async with aiohttp.ClientSession() as session:
+            income = await _get_driver_income(session, park, str(driver["id"]))
+            orders = await _get_driver_orders_stats(
+                session, park, str(driver["id"]), goal_start_dt=get_goal_start_dt(chat_id)
+            )
+        periods = orders.get("periods") if isinstance(orders.get("periods"), dict) else {}
+        def period_line(key: str, title: str) -> str:
+            item = periods.get(key) if isinstance(periods.get(key), dict) else {}
+            return (f"{title}: заказов {int(item.get('orders') or 0)}, "
+                    f"доход по заказам {round(_safe_float(item.get('earned')))} ₽, "
+                    f"расстояние {round(_safe_float(item.get('km')), 1)} км")
+        return "\\n".join([
+            "Статистика авторизованного пользователя (данные парка, не раскрывать другим):",
+            f"Доход сегодня: {round(_safe_float(income.get('today')))} ₽",
+            f"Доход за 7 дней: {round(_safe_float(income.get('week')))} ₽",
+            f"Доход за 30 дней: {round(_safe_float(income.get('month')))} ₽",
+            period_line("day", "Заказы сегодня"),
+            period_line("week", "Заказы за 7 дней"),
+            period_line("month", "Заказы за 30 дней"),
+            "Если статистика недоступна или отсутствует — прямо сообщи об этом, не придумывай значения.",
+        ])
+    except Exception:
+        logger.exception("ИИ: не удалось подготовить личный контекст chat_id=%s", chat_id)
+        return ""
+
+
 async def answer_simple_question_with_ai(user_text: str, chat_id: int | str | None = None) -> str | None:
     low = (user_text or "").strip().lower()
     if not low or len(low) < 3:
@@ -831,7 +887,8 @@ async def answer_simple_question_with_ai(user_text: str, chat_id: int | str | No
         return None
     # Длинные цифровые последовательности (телефоны, документы) в ИИ не отправляем.
     safe_text = re.sub(r"\d{5,}", "…", user_text.strip())[:400]
-    answer = await _call_ai(safe_text)
+    trusted_context = await _build_ai_courier_context(chat_id) if chat_id is not None else ""
+    answer = await _call_ai(safe_text, trusted_context=trusted_context)
     if answer:
         logger.info("ИИ ответил пользователю %s (%s симв.)", chat_id, len(answer))
     return answer
