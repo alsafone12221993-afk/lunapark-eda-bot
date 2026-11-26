@@ -49,7 +49,7 @@ AI_BASE_URL = os.getenv(
     else ("https://api.anthropic.com/v1/messages" if AI_PROVIDER == "anthropic" else "https://api.openai.com/v1/chat/completions"),
 ).strip()
 AI_MODEL = (os.getenv("AI_MODEL", "").strip()
-            or (f"gpt://{YANDEX_FOLDER_ID}/yandexgpt/latest" if AI_PROVIDER == "yandex" and YANDEX_FOLDER_ID
+            or (f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-5.1" if AI_PROVIDER == "yandex" and YANDEX_FOLDER_ID
                 else ("claude-haiku-5-5" if AI_PROVIDER == "anthropic" else "gpt-4o-mini")))
 AI_MAX_ANSWERS_PER_HOUR = int(os.getenv("AI_MAX_ANSWERS_PER_HOUR", "8"))
 
@@ -794,7 +794,10 @@ async def _call_ai(user_text: str, trusted_context: str = "") -> str | None:
                     "messages": [{"role": "user", "content": user_text}],
                 }
             else:
-                headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
+                headers = {"Authorization": f"Api-Key {AI_API_KEY}" if AI_PROVIDER == "yandex" else f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
+                if AI_PROVIDER == "yandex":
+                    headers["OpenAI-Project"] = YANDEX_FOLDER_ID
+                    headers["x-data-logging-enabled"] = "false"
                 body = {
                     "model": AI_MODEL,
                     "temperature": 0.3,
