@@ -820,7 +820,9 @@ async def _call_ai(
                     return None
                 headers = {
                     "Authorization": f"Api-Key {AI_API_KEY}",
-                    "OpenAI-Project": YANDEX_FOLDER_ID,
+                    # Yandex AI Studio Responses API ожидает x-folder-id / x-project,
+                    # а не OpenAI-Project.
+                    "x-folder-id": YANDEX_FOLDER_ID,
                     "Content-Type": "application/json",
                     "x-data-logging-enabled": "false",
                 }
@@ -843,7 +845,11 @@ async def _call_ai(
                     json=body,
                 ) as resp:
                     if resp.status != 200:
-                        logger.warning("YandexGPT Responses API HTTP %s: %s", resp.status, (await resp.text())[:300])
+                        error_text = (await resp.text())[:500]
+                        logger.warning(
+                            "YandexGPT Responses API HTTP %s: %s | folder_id_set=%s | api_key_set=%s",
+                            resp.status, error_text, bool(YANDEX_FOLDER_ID), bool(AI_API_KEY)
+                        )
                         return None
                     data = await resp.json()
                 answer = str(data.get("output_text") or "").strip()
