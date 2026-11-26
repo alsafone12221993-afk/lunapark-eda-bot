@@ -790,7 +790,7 @@ async def _call_ai(user_text: str, trusted_context: str = "") -> str | None:
                     "model": AI_MODEL,
                     "max_tokens": 300,
                     "temperature": 0.3,
-                    "system": AI_SYSTEM_PROMPT + ("\\n\\nДОВЕРЕННЫЕ ДАННЫЕ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ (используй только для ответа ему):\\n" + trusted_context if trusted_context else ""),
+                    "system": AI_SYSTEM_PROMPT + ("\n\nДОВЕРЕННЫЕ ДАННЫЕ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ (используй только для ответа ему):\n" + trusted_context if trusted_context else ""),
                     "messages": [{"role": "user", "content": user_text}],
                 }
             else:
@@ -803,7 +803,7 @@ async def _call_ai(user_text: str, trusted_context: str = "") -> str | None:
                     "temperature": 0.3,
                     "max_tokens": 300,
                     "messages": [
-                        {"role": "system", "content": AI_SYSTEM_PROMPT + ("\\n\\nДОВЕРЕННЫЕ ДАННЫЕ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ (используй только для ответа ему):\\n" + trusted_context if trusted_context else "")},
+                        {"role": "system", "content": AI_SYSTEM_PROMPT + ("\n\nДОВЕРЕННЫЕ ДАННЫЕ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ (используй только для ответа ему):\n" + trusted_context if trusted_context else "")},
                         {"role": "user", "content": user_text},
                     ],
                 }
@@ -862,7 +862,7 @@ async def _build_ai_courier_context(chat_id: int | str) -> str:
             return (f"{title}: заказов {int(item.get('orders') or 0)}, "
                     f"доход по заказам {round(_safe_float(item.get('earned')))} ₽, "
                     f"расстояние {round(_safe_float(item.get('km')), 1)} км")
-        return "\\n".join([
+        return "\n".join([
             "Статистика авторизованного пользователя (данные парка, не раскрывать другим):",
             f"Доход сегодня: {round(_safe_float(income.get('today')))} ₽",
             f"Доход за 7 дней: {round(_safe_float(income.get('week')))} ₽",
