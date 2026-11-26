@@ -4350,14 +4350,14 @@ async def notify_superadmin_about_demand(city_name: str, rate_rub_hour: int = DE
         return False
     save_pending_demand(clean_city, rate_rub_hour)
     preview = (
-        f"🔥 ПОВЫШЕННЫЙ СПРОС\\n"
-        f"━━━━━━━━━━━━━━━━━━\\n"
-        f"📍 Город: {clean_city}\\n"
-        f"💰 Ставка: от {rate_rub_hour} ₽/час\\n"
-        f"👥 Получателей: {len(recipients)} курьеров\\n"
-        f"━━━━━━━━━━━━━━━━━━\\n\\n"
-        f"Предлагаемый текст уведомления:\\n"
-        f"«🔥 В {clean_city} сейчас повышенный спрос на курьеров. Заказы — от {rate_rub_hour} ₽/час. Выходи на линию!»\\n\\n"
+        f"🔥 ПОВЫШЕННЫЙ СПРОС\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📍 Город: {clean_city}\n"
+        f"💰 Ставка: от {rate_rub_hour} ₽/час\n"
+        f"👥 Получателей: {len(recipients)} курьеров\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"Предлагаемый текст уведомления:\n"
+        f"«🔥 В {clean_city} сейчас повышенный спрос на курьеров. Заказы — от {rate_rub_hour} ₽/час. Выходи на линию!»\n\n"
         f"Отправка НЕ начнётся без твоего подтверждения."
     )
     await tg_send_text(SUPERADMIN_ID, preview, reply_markup=kb_demand_confirm(city_key))
@@ -5446,12 +5446,12 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
                 report.extend(f"• {err[:250]}" for err in demand_errors)
             else:
                 report.extend(["", "✅ Данные Fleet API получены."])
-            await tg_send_text(chat_id, "\\n".join(report), reply_markup=kb_admin_menu(True))
+            await tg_send_text(chat_id, "\n".join(report), reply_markup=kb_admin_menu(True))
         except Exception as exc:
             logger.exception("Ручная проверка спроса завершилась ошибкой")
             await tg_send_text(
                 chat_id,
-                f"❌ Не удалось проверить спрос через Fleet API.\\n{str(exc)[:500]}",
+                f"❌ Не удалось проверить спрос через Fleet API.\n{str(exc)[:500]}",
                 reply_markup=kb_admin_menu(True),
             )
         return
