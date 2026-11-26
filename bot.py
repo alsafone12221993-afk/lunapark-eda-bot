@@ -1487,12 +1487,13 @@ async def wazzup_send_message(
         payload["text"] = text
     if content_uri:
         payload["contentUri"] = content_uri
-    # Wazzup supports Telegram keyboard buttons via buttonsObject.
+    # Wazzup expects buttons grouped by rows, just like Telegram keyboards.
     if reply_markup:
         keyboard = reply_markup.get("inline_keyboard")
         if isinstance(keyboard, list):
-            buttons = []
+            rows = []
             for row in keyboard:
+                row_buttons = []
                 for btn in row if isinstance(row, list) else []:
                     if not isinstance(btn, dict):
                         continue
@@ -1503,18 +1504,23 @@ async def wazzup_send_message(
                         item["url"] = str(btn["url"])
                     else:
                         continue
-                    buttons.append(item)
-            if buttons:
-                payload["buttonsObject"] = {"buttons": buttons, "replyMarkup": "inline"}
+                    row_buttons.append(item)
+                if row_buttons:
+                    rows.append(row_buttons)
+            if rows:
+                payload["buttonsObject"] = {"buttons": rows, "replyMarkup": "inline"}
         elif isinstance(reply_markup.get("keyboard"), list):
-            buttons = []
+            rows = []
             for row in reply_markup["keyboard"]:
+                row_buttons = []
                 for btn in row if isinstance(row, list) else []:
                     label = btn.get("text") if isinstance(btn, dict) else btn
                     if label:
-                        buttons.append({"text": str(label)})
-            if buttons:
-                payload["buttonsObject"] = {"buttons": buttons, "replyMarkup": "keyboard"}
+                        row_buttons.append({"text": str(label)})
+                if row_buttons:
+                    rows.append(row_buttons)
+            if rows:
+                payload["buttonsObject"] = {"buttons": rows, "replyMarkup": "reply"}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -1543,9 +1549,25 @@ async def tg_send_text(
     reply_markup: dict[str, Any] | None = None,
     parse_mode: str | None = None,
 ) -> int | None:
-    # Bot menus and automated replies must go directly through Telegram Bot API.
-    # Wazzup is the operator inbox; routing every bot reply through Wazzup
-    # breaks Telegram reply-keyboards and fills the operator chat with bot menus.
+    # In Wazzup mode incoming chat_id comes from the Wazzup webhook and replies
+    # must use the same Wazzup channel. It is not guaranteed to be a Telegram Bot API chat_id.
+    if WAZZUP_ENABLED:
+        result = await wazzup_send_message(chat_id, text, reply_markup=reply_markup)
+        if not result.get("ok"):
+            logger.error(
+                "Не удалось отправить ответ через Wazzup: chat_id=%s result=%s",
+                chat_id, str(result)[:500],
+            )
+            return None
+        response_data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        logger.info(
+            "Сообщение отправлено через Wazzup: chat_id=%s message_id=%s",
+            chat_id, response_data.get("messageId", "accepted"),
+        )
+        # Wazzup message IDs are GUIDs, not Telegram message_id integers.
+        # Telegram deleteMessage cannot delete messages sent through Wazzup.
+        return None
+
     if not TELEGRAM_BOT_TOKEN:
         logger.error("Не задан TELEGRAM_BOT_TOKEN")
         return None
