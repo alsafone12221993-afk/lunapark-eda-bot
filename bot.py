@@ -927,6 +927,9 @@ async def _build_ai_courier_context(chat_id: int | str) -> str:
             orders = await _get_driver_orders_stats(
                 session, park, str(driver["id"]), goal_start_dt=get_goal_start_dt(chat_id)
             )
+        if not orders.get("ok"):
+            logger.warning("ИИ: статистика заказов недоступна для chat_id=%s", chat_id)
+            return ""
         periods = orders.get("periods") if isinstance(orders.get("periods"), dict) else {}
         def period_line(key: str, title: str) -> str:
             item = periods.get(key) if isinstance(periods.get(key), dict) else {}
@@ -962,6 +965,8 @@ async def answer_simple_question_with_ai(user_text: str, chat_id: int | str | No
     if not _ai_allowed(chat_id):
         return None
     trusted_context = await _build_ai_courier_context(chat_id) if personal_stats_question and chat_id is not None else ""
+    if personal_stats_question and not trusted_context:
+        return "Сначала подтверди номер профиля кнопкой «📱 Отправить номер профиля». После подтверждения я смогу проверить только твою статистику."
     # Веб-поиск не получает вопросы о личном доходе/заказах: он работает вне контура ФЗ-152.
     answer = await _call_ai(safe_text, trusted_context=trusted_context, use_web_search=not personal_stats_question)
     if answer:
