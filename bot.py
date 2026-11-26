@@ -888,17 +888,18 @@ async def answer_simple_question_with_ai(user_text: str, chat_id: int | str | No
     if not low or len(low) < 3:
         return None
     personal_stats_question = bool(re.search(r"(мой|мои|у меня|я )?.{0,35}(заработ|доход|заказ|километр|статистик)|сколько\s+(я\s+)?(заработал|получил|сделал|выполнил)", low))
-    faq = None if personal_stats_question else _quick_faq_answer(low)
+    # Сначала ищем официальный материал Яндекса, чтобы общие FAQ бота не подменяли правила сервиса.
+    safe_text = re.sub(r"\d{5,}", "…", user_text.strip())[:400]
+    kb_context = search_yandex_eda_knowledge(safe_text, limit=4)
+    faq = None if personal_stats_question or kb_context else _quick_faq_answer(low)
     if faq:
         return faq
     if not AI_API_KEY:
         return None
     if not _ai_allowed(chat_id):
         return None
-    # Длинные цифровые последовательности (телефоны, документы) в ИИ не отправляем.
-    safe_text = re.sub(r"\d{5,}", "…", user_text.strip())[:400]
     trusted_context = await _build_ai_courier_context(chat_id) if chat_id is not None else ""
-    answer = await _call_ai(safe_text, trusted_context=trusted_context)
+    answer = await _call_ai(safe_text, trusted_context=trusted_context, kb_context=kb_context)
     if answer:
         logger.info("ИИ ответил пользователю %s (%s симв.)", chat_id, len(answer))
     return answer
@@ -6385,6 +6386,7 @@ async def yandex_eda_kb_sync_worker() -> None:
 
 async def on_startup(app: web.Application) -> None:
     app["delayed_worker"] = asyncio.create_task(delayed_notifications_worker())
+    app["yandex_eda_kb_sync_task"] = asyncio.create_task(yandex_eda_kb_sync_worker())
     app["ephemeral_worker"] = asyncio.create_task(ephemeral_cleaner_worker())
     app["demand_worker"] = asyncio.create_task(demand_monitor_worker())
     if WAZZUP_ENABLED:
