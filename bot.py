@@ -71,13 +71,27 @@ AUTH_WINDOW_SEC = 600
 AUTH_LOCK_LEVELS_SEC = [900, 3600, 86400]
 FLOOD_MAX_MSG_PER_MIN = 25
 
+# Fleet API и YandexGPT используют РАЗНЫЕ ключи.
+# Для совместимости поддерживаем несколько названий переменной Fleet API,
+# но намеренно НЕ используем YANDEX_API_KEY: он зарезервирован для YandexGPT.
+YANDEX_PARK_ID_VALUE = os.getenv(
+    "YANDEX_PARK_ID", "1680a13d35084b0688ecab0f925c9d75"
+).strip()
+YANDEX_CLIENT_ID_VALUE = os.getenv(
+    "YANDEX_CLIENT_ID", f"taxi/park/{YANDEX_PARK_ID_VALUE}"
+).strip()
+YANDEX_FLEET_API_KEY_VALUE = (
+    os.getenv("YANDEX_FLEET_API_KEY", "").strip()
+    or os.getenv("YANDEX_GO_FLEET_API_KEY", "").strip()
+    or os.getenv("FLEET_API_KEY", "").strip()
+)
+
 PARKS_CONFIG: list[dict[str, str]] = [
     {
         "name": "ЛунапаркЕда",
-        "park_id": os.getenv("YANDEX_PARK_ID", "1680a13d35084b0688ecab0f925c9d75"),
-        "client_id": os.getenv("YANDEX_CLIENT_ID", "taxi/park/1680a13d35084b0688ecab0f925c9d75"),
-        # Отдельный ключ Fleet API. Не использовать YANDEX_API_KEY: он предназначен только для YandexGPT.
-        "api_key": os.getenv("YANDEX_FLEET_API_KEY", "").strip(),
+        "park_id": YANDEX_PARK_ID_VALUE,
+        "client_id": YANDEX_CLIENT_ID_VALUE,
+        "api_key": YANDEX_FLEET_API_KEY_VALUE,
     },
 ]
 
@@ -2766,6 +2780,23 @@ async def _post_fleet_with_retry(
                 last_err = "HTTP 429"
                 await asyncio.sleep(wait_sec)
                 continue
+            if resp.status == 403:
+                logger.error(
+                    "Fleet API 403: park_id_present=%s client_id_present=%s fleet_key_present=%s "
+                    "park_id_length=%s client_id_length=%s fleet_key_length=%s",
+                    bool(park.get("park_id")),
+                    bool(park.get("client_id")),
+                    bool(park.get("api_key")),
+                    len(park.get("park_id", "")),
+                    len(park.get("client_id", "")),
+                    len(park.get("api_key", "")),
+                )
+                raise RuntimeError(
+                    "Fleet API HTTP 403: Яндекс отклонил Client ID или Fleet API key. "
+                    "Проверьте YANDEX_PARK_ID, YANDEX_CLIENT_ID и YANDEX_FLEET_API_KEY "
+                    "(это отдельный ключ Fleet API, не ключ YandexGPT). "
+                    + text[:180]
+                )
             if resp.status != 200:
                 raise RuntimeError(f"HTTP {resp.status}: {text[:250]}")
             return json.loads(text)
