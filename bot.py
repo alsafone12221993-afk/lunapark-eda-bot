@@ -881,7 +881,8 @@ async def answer_simple_question_with_ai(user_text: str, chat_id: int | str | No
     low = (user_text or "").strip().lower()
     if not low or len(low) < 3:
         return None
-    faq = _quick_faq_answer(low)
+    personal_stats_question = bool(re.search(r"(мой|мои|у меня|я )?.{0,35}(заработ|доход|заказ|километр|статистик)|сколько\s+(я\s+)?(заработал|получил|сделал|выполнил)", low))
+    faq = None if personal_stats_question else _quick_faq_answer(low)
     if faq:
         return faq
     if not AI_API_KEY:
