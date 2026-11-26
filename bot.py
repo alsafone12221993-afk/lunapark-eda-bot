@@ -76,7 +76,8 @@ PARKS_CONFIG: list[dict[str, str]] = [
         "name": "ЛунапаркЕда",
         "park_id": os.getenv("YANDEX_PARK_ID", "1680a13d35084b0688ecab0f925c9d75"),
         "client_id": os.getenv("YANDEX_CLIENT_ID", "taxi/park/1680a13d35084b0688ecab0f925c9d75"),
-        "api_key": os.getenv("YANDEX_API_KEY", ""),
+        # Отдельный ключ Fleet API. Не использовать YANDEX_API_KEY: он предназначен только для YandexGPT.
+        "api_key": os.getenv("YANDEX_FLEET_API_KEY", "").strip(),
     },
 ]
 
