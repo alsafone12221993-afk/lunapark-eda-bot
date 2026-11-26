@@ -352,6 +352,14 @@ MSK_TZ = timezone(timedelta(hours=3))
 SUPPORT_CHAT_URL = "https://t.me/LUNAPARK_DR"
 SUPPORT_CHAT_USERNAME = "@LUNAPARK_DR"
 CONNECT_PROFILE_URL = "https://t.me/Lunapark_support_bot"
+THERMOBOX_URL = os.getenv("THERMOBOX_URL", "https://clck.ru/3XEVUW").strip()
+THERMOBOX_TEXT = (
+    "🎒 Термокороб\n\n"
+    "Ты можешь приобрести короб у нас в офисе по адресу: Оптиков, д. 1, корп. 3, оф. 24. "
+    "Стоимость — 1000 руб.\n"
+    "О наличии уточняй заранее!\n\n"
+    "Или перейди по ссылке и выбери удобную точку выдачи 👇"
+)
 SUPPORT_PHONE_DISPLAY = "+7 (999) 515-70-42"
 INCOME_CACHE: dict[str, dict[str, Any]] = {}
 INCOME_TTL_SEC = 60
@@ -476,7 +484,7 @@ def kb_bot_users_menu() -> dict[str, Any]:
         ["📊 Нажали статистику", "💰 Нажали доход"],
         ["⚖️ Нажали корректировки", "🎁 Нажали бонус"],
         ["📚 Нажали обучение", "💬 Нажали чат"],
-        ["❓ Нажали помощь"],
+        ["❓ Нажали помощь", "🎒 Нажали термокороб"],
         ["🟢 Активные 24 часа", "👤 Все пользователи"],
         ["🟡 Неактивные 7+ дней", "🔴 Неактивные 30+ дней"],
         ["📨 Получили рассылку", "⛔ Заблокировали бота"],
@@ -568,15 +576,15 @@ def kb_courier_cabinet(show_bonus: bool = True) -> dict[str, Any]:
             ["📊 Моя статистика", "🎁 Бонус"],
             ["💰 Доход в парке", "⚖️ Корректировки"],
             ["📚 Обучение", "💬 Чат курьеров"],
-            ["❓ Помощь"],
+            ["🎒 Термокороб", "❓ Помощь"],
             ["⬅️ В начало"],
         ]
     else:
         rows = [
             ["📊 Моя статистика", "💰 Доход в парке"],
             ["⚖️ Корректировки", "📚 Обучение"],
-            ["💬 Чат курьеров", "❓ Помощь"],
-            ["⬅️ В начало"],
+            ["💬 Чат курьеров", "🎒 Термокороб"],
+            ["❓ Помощь", "⬅️ В начало"],
         ]
     return _reply_kb(rows)
 
@@ -2279,6 +2287,69 @@ def _extract_order_price(order: dict[str, Any]) -> float:
     return 0.0
 
 
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    import math
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _extract_lat_lon(p: Any) -> Optional[tuple[float, float]]:
+    try:
+        if isinstance(p, dict):
+            lat = p.get("lat", p.get("latitude"))
+            lon = p.get("lon", p.get("lng", p.get("longitude")))
+            if lat is not None and lon is not None:
+                return float(lat), float(lon)
+            for key in ("geopoint", "point", "position", "coordinates", "location", "geo"):
+                if key in p:
+                    res = _extract_lat_lon(p[key])
+                    if res:
+                        return res
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            lon, lat = float(p[0]), float(p[1])  # у Яндекса порядок [lon, lat]
+            if abs(lat) <= 90 and abs(lon) <= 180:
+                return lat, lon
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _points_distance_km(points: list[Any], max_jump_km: float = 3.0) -> float:
+    coords = [c for c in (_extract_lat_lon(p) for p in points) if c]
+    total = 0.0
+    for (la1, lo1), (la2, lo2) in zip(coords, coords[1:]):
+        seg = _haversine_km(la1, lo1, la2, lo2)
+        if seg <= max_jump_km:  # отсекаем скачки GPS
+            total += seg
+    return total
+
+
+def _estimate_order_distance_km(order: dict[str, Any]) -> float:
+    """Приблизительное расстояние по точкам маршрута заказа (прямые отрезки × 1.25)."""
+    pts: list[Any] = []
+    if order.get("address_from") is not None:
+        pts.append(order.get("address_from"))
+    rp = order.get("route_points")
+    if isinstance(rp, list):
+        pts.extend(rp)
+    for key in ("address_to", "destination"):
+        if order.get(key) is not None:
+            pts.append(order.get(key))
+    coords = [c for c in (_extract_lat_lon(p) for p in pts) if c]
+    dedup: list[tuple[float, float]] = []
+    for c in coords:
+        if not dedup or c != dedup[-1]:
+            dedup.append(c)
+    if len(dedup) < 2:
+        return 0.0
+    total = sum(_haversine_km(a[0], a[1], b[0], b[1]) for a, b in zip(dedup, dedup[1:]))
+    return total * 1.25
+
+
 def _load_order_distances() -> dict[str, Any]:
     data = _read_json(ORDER_DISTANCES_FILE, {})
     return data if isinstance(data, dict) else {}
@@ -2298,10 +2369,122 @@ async def _fetch_order_track_km(
         max_attempts=2,
     )
     best_m = 0.0
-    for point in data.get("track") or []:
+    points = data.get("track") or data.get("points") or []
+    if not isinstance(points, list):
+        points = []
+    for point in points:
         if isinstance(point, dict):
             best_m = max(best_m, _safe_float(point.get("distance")))
-    return best_m / 1000.0
+    if best_m > 0:
+        return best_m / 1000.0
+    # В треке нет готового расстояния — считаем по координатам точек.
+    return _points_distance_km(points)
+
+
+def _collect_distance_fields(obj: Any, path: str = "", depth: int = 0) -> list[tuple[str, Any]]:
+    found: list[tuple[str, Any]] = []
+    if depth > 4:
+        return found
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            low = str(key).lower()
+            p = f"{path}.{key}" if path else str(key)
+            if isinstance(val, (dict, list)):
+                found.extend(_collect_distance_fields(val, p, depth + 1))
+            elif any(w in low for w in ("mileage", "distance", "km", "length")):
+                found.append((p, val))
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj[:5]):
+            found.extend(_collect_distance_fields(item, f"{path}[{i}]", depth + 1))
+    return found
+
+
+async def build_km_diagnostics_text(phone: str = "") -> str:
+    """Диагностика: что реально отдаёт Fleet API по расстоянию заказа (для суперадмина)."""
+    out = ["🔧 ДИАГНОСТИКА РАССТОЯНИЯ", ""]
+    now = datetime.now(timezone.utc)
+    park = PARKS_CONFIG[0]
+    order: Optional[dict[str, Any]] = None
+    tried = 0
+    try:
+        async with aiohttp.ClientSession() as session:
+            if phone:
+                profiles = await _find_all_profiles_by_phone(session, normalize_phone(phone))
+                driver_ids = [str(p["id"]) for p in profiles if p.get("id")]
+            else:
+                drivers = await get_cached_drivers(session, park, force_refresh=False)
+                driver_ids = []
+                for item in drivers:
+                    prof = (item.get("driver_profile") or {}) if isinstance(item, dict) else {}
+                    if prof.get("id") and str(prof.get("work_status") or "") == "working":
+                        driver_ids.append(str(prof["id"]))
+                driver_ids = driver_ids[:25]
+            for did in driver_ids:
+                tried += 1
+                try:
+                    data = await _post_fleet_with_retry(
+                        session, park, "/v1/parks/orders/list",
+                        {"query": {"park": {"id": park["park_id"], "driver_profile": {"id": did},
+                                            "order": {"booked_at": {
+                                                "from": (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                                "to": now.strftime("%Y-%m-%dT%H:%M:%SZ")}}}},
+                         "limit": 20},
+                        max_attempts=2,
+                    )
+                except Exception as exc:
+                    out.append(f"orders/list для водителя не прошёл: {str(exc)[:200]}")
+                    continue
+                for o in data.get("orders") or []:
+                    if isinstance(o, dict) and _is_completed_order_status(str(o.get("status") or "")):
+                        order = o
+                        break
+                if order:
+                    break
+                await asyncio.sleep(0.3)
+
+            if not order:
+                out.append(f"Проверено водителей: {tried}. Выполненных заказов за 7 дней не найдено.")
+                return "\n".join(out)[:3500]
+
+            oid = str(order.get("id") or "")
+            out.append(f"Заказ: #{oid[:8]} · статус: {order.get('status')}")
+            out.append(f"Поля заказа: {', '.join(sorted(order.keys()))}"[:700])
+            dist_fields = _collect_distance_fields(order)
+            out.append("Поля с расстоянием: " + (", ".join(f"{k}={str(v)[:20]}" for k, v in dist_fields[:8]) or "нет"))
+            out.append(f"Распознано в заказе: {_extract_order_distance_km(order):.2f} км")
+            rp = order.get("route_points")
+            out.append(
+                f"Точек маршрута: {len(rp) if isinstance(rp, list) else 0}; "
+                f"приблизительно по точкам: {_estimate_order_distance_km(order):.2f} км"
+            )
+            if isinstance(rp, list) and rp and isinstance(rp[0], dict):
+                out.append(f"Ключи точки маршрута: {', '.join(sorted(rp[0].keys()))}"[:300])
+            try:
+                tdata = await _post_fleet_with_retry(
+                    session, park, "/v1/parks/orders/track",
+                    {"order_id": oid, "park_id": park["park_id"]}, max_attempts=1,
+                )
+                pts = tdata.get("track") or tdata.get("points") or []
+                n = len(pts) if isinstance(pts, list) else 0
+                keys0 = sorted(pts[0].keys()) if n and isinstance(pts[0], dict) else []
+                out.append(
+                    f"orders/track: OK, ключи ответа: {', '.join(sorted(tdata.keys()))}; точек: {n}; "
+                    f"ключи точки: {', '.join(keys0) or '—'}; "
+                    f"расстояние по треку: {_fetch_track_km_from_data(tdata):.2f} км"
+                )
+            except Exception as exc:
+                out.append(f"orders/track: ОШИБКА: {str(exc)[:350]}")
+    except Exception as exc:
+        out.append(f"Диагностика прервана: {str(exc)[:300]}")
+    return "\n".join(out)[:3500]
+
+
+def _fetch_track_km_from_data(tdata: dict[str, Any]) -> float:
+    points = tdata.get("track") or tdata.get("points") or []
+    if not isinstance(points, list):
+        return 0.0
+    best_m = max((_safe_float(p.get("distance")) for p in points if isinstance(p, dict)), default=0.0)
+    return best_m / 1000.0 if best_m > 0 else _points_distance_km(points)
 
 
 def _short_first_name(full_name: str) -> str:
@@ -2531,7 +2714,7 @@ def _is_active_in_progress_order_status(status: str) -> bool:
 
 
 def _empty_periods() -> dict[str, dict[str, Any]]:
-    return {k: {"orders": 0, "earned": 0.0, "km": 0.0, "km_missing": 0} for k in ("day", "week", "month")}
+    return {k: {"orders": 0, "earned": 0.0, "km": 0.0, "km_missing": 0, "km_est": 0} for k in ("day", "week", "month")}
 
 
 async def _fetch_driver_orders_window(
@@ -2613,7 +2796,8 @@ async def _get_driver_orders_stats(
         agg = _empty_periods()
         completed_goal = 0
         known_dist = _load_order_distances()
-        pending: list[tuple[datetime, str, list[str]]] = []
+        pending: list[tuple[datetime, str, list[str], dict[str, Any]]] = []
+        resolved: set[str] = set()
         logged_keys = False
 
         for order in orders:
@@ -2645,14 +2829,14 @@ async def _get_driver_orders_stats(
                 if not logged_keys:
                     logger.info("orders/list: у заказа нет расстояния, поля заказа: %s", sorted(order.keys()))
                     logged_keys = True
-                pending.append((odt or now, oid, keys))
+                pending.append((odt or now, oid, keys, order))
 
         # Догружаем расстояние по трекам (самые свежие заказы первыми), результат кэшируем в файл.
         if pending:
             pending.sort(key=lambda x: x[0], reverse=True)
             fetched = 0
             changed = False
-            for odt, oid, keys in pending:
+            for odt, oid, keys, _ord in pending:
                 if fetched >= TRACK_FETCH_LIMIT:
                     break
                 ck = f"{park['park_id']}:{oid}"
@@ -2668,12 +2852,24 @@ async def _get_driver_orders_stats(
                 known_dist[ck] = {"km": round(km, 3), "ts": time.time()}
                 changed = True
                 if km > 0:
+                    resolved.add(oid)
                     for k in keys:
                         agg[k]["km"] += km
                         agg[k]["km_missing"] = max(0, agg[k]["km_missing"] - 1)
                 await asyncio.sleep(0.3)
             if changed:
                 _write_json(ORDER_DISTANCES_FILE, known_dist)
+
+            # Для заказов, где трек недоступен, считаем приблизительно по точкам маршрута.
+            for odt, oid, keys, ord_item in pending:
+                if oid in resolved:
+                    continue
+                est = _estimate_order_distance_km(ord_item)
+                if est > 0:
+                    for k in keys:
+                        agg[k]["km"] += est
+                        agg[k]["km_missing"] = max(0, agg[k]["km_missing"] - 1)
+                        agg[k]["km_est"] += 1
 
         for k in agg:
             agg[k]["earned"] = round(agg[k]["earned"], 2)
@@ -2943,6 +3139,7 @@ def track_bot_user_activity(
         "группа обучения": "📚 Обучение",
         "чат курьеров": "💬 Чат курьеров",
         "чат": "💬 Чат курьеров",
+        "термокороб": "🎒 Термокороб",
         "бонус": "🎁 Бонус",
         "цель": "🎁 Бонус",
         "отмена": "❌ Отмена",
@@ -2988,7 +3185,8 @@ def track_bot_user_activity(
         button_counts[label] = int(button_counts.get(label) or 0) + 1
         rec["button_counts"] = button_counts
     else:
-        label = "Сообщение / ввод"
+        snippet = re.sub(r"\d{5,}", "…", " ".join((button_text or "").split()))[:50]
+        label = f"✍️ Написал: {snippet}" if snippet else "📎 Вложение / медиа"
         event_action = "message"
     rec["last_action"] = label
     rec["last_action_at"] = now
@@ -3149,6 +3347,7 @@ def build_bot_users_segment_text(segment: str) -> str:
         "training": "📚 ПОЛЬЗОВАТЕЛИ, ОТКРЫВАВШИЕ ОБУЧЕНИЕ",
         "chat": "💬 ПОЛЬЗОВАТЕЛИ, ОТКРЫВАВШИЕ ЧАТ КУРЬЕРОВ",
         "help": "❓ ПОЛЬЗОВАТЕЛИ, НАЖИМАВШИЕ ПОМОЩЬ",
+        "thermobox": "🎒 ПОЛЬЗОВАТЕЛИ, ОТКРЫВАВШИЕ ТЕРМОКОРОБ",
         "active": "🟢 АКТИВНЫЕ ЗА ПОСЛЕДНИЕ 24 ЧАСА",
         "inactive7": "🟡 НЕАКТИВНЫЕ БОЛЕЕ 7 ДНЕЙ",
         "inactive30": "🔴 НЕАКТИВНЫЕ БОЛЕЕ 30 ДНЕЙ",
@@ -3175,6 +3374,7 @@ def build_bot_users_segment_text(segment: str) -> str:
             "training": "📚 Обучение",
             "chat": "💬 Чат курьеров",
             "help": "❓ Помощь",
+            "thermobox": "🎒 Термокороб",
         }.get(segment)
         if segment_button:
             button_counts = rec.get("button_counts") if isinstance(rec.get("button_counts"), dict) else {}
@@ -4145,11 +4345,12 @@ async def show_courier_statistics(chat_id: int | str, driver: dict[str, Any]) ->
         _format_period_block("📆 За 30 дней", periods.get("month") or {}, icon, word),
     ]
     any_missing = any(int((periods.get(k) or {}).get("km_missing") or 0) > 0 for k in ("day", "week", "month"))
-    note = (
-        "\nℹ️ Километры посчитаны не по всем заказам — по части данных пока нет. Загляни позже, они подтянутся.\n"
-        if any_missing
-        else ""
-    )
+    any_est = any(int((periods.get(k) or {}).get("km_est") or 0) > 0 for k in ("day", "week", "month"))
+    note = ""
+    if any_est:
+        note += "\nℹ️ Знак «≈» — расстояние посчитано приблизительно по точкам маршрута.\n"
+    if any_missing:
+        note += "\nℹ️ Километры посчитаны не по всем заказам — по части данных пока нет. Загляни позже, они подтянутся.\n"
     text = (
         "📊 Твоя статистика\n\n"
         f"🏢 Парк: {driver['park_name']}\n"
@@ -4180,8 +4381,11 @@ def _format_period_block(title: str, p: dict[str, Any], icon: str, word: str) ->
     earned = float(p.get("earned") or 0.0)
     km = float(p.get("km") or 0.0)
     missing = int(p.get("km_missing") or 0)
+    est = int(p.get("km_est") or 0)
     earned_txt = f"{earned:.0f} ₽" if earned > 0 else ("0 ₽" if orders == 0 else "—")
     km_txt = f"{km:.1f} км"
+    if est > 0 and orders > 0:
+        km_txt = f"≈ {km:.1f} км"
     if missing > 0 and orders > 0:
         km_txt += " (не по всем заказам)"
     return (
@@ -4548,6 +4752,12 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             await tg_send_text(chat_id, f"Номер {target_p} не был привязан.", reply_markup=kb_admin_menu(True))
         return
 
+    if raw_text.startswith("/diag_km") and is_super:
+        parts = raw_text.split(maxsplit=1)
+        await send_ephemeral_text(chat_id, "Запрашиваю заказ и трек в Fleet API, это займёт до минуты...", ttl_sec=20)
+        await tg_send_text(chat_id, await build_km_diagnostics_text(parts[1].strip() if len(parts) > 1 else ""))
+        return
+
     if raw_text.strip().lower() == "/admins" and is_adm:
         admins_list = load_admin_config()["admins"]
         await tg_send_text(chat_id, f"👥 Админы: {', '.join(admins_list)}\nСуперадмин: {SUPERADMIN_ID}", reply_markup=kb_admin_menu(is_super))
@@ -4643,7 +4853,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             "админка", "сводка за период", "заказы", "заказы в час", "заказыв час", "период",
             "массовая рассылка", "рассылка", "пользователи бота", "аналитика пользователей", "пользователи",
             "проверить спрос", "спрос", "нажали подключиться", "нажали уже курьер", "активные 24 часа",
-            "все пользователи", "нажали статистику", "нажали доход", "нажали корректировки", "нажали бонус", "нажали обучение", "нажали чат", "нажали помощь",
+            "все пользователи", "нажали статистику", "нажали доход", "нажали корректировки", "нажали бонус", "нажали обучение", "нажали чат", "нажали помощь", "нажали термокороб",
             "неактивные 7+ дней", "неактивные 30+ дней", "получили рассылку", "заблокировали бота", "последние действия",
             "история рассылок", "в админку", "назад в админку",
         }))
@@ -4664,6 +4874,14 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             "как выходить на стабильный заработок и где искать ответы на частые вопросы. "
             "Заходи, читай и задавай вопросы — новичкам тут всегда рады 💙",
             reply_markup={"inline_keyboard": [[{"text": "📚 Открыть группу обучения", "url": LUNAPARK_STUDY_URL}]]},
+        )
+        return
+
+    if norm_cmd in ("термокороб", "термокороб курьера") and get_user_record(chat_id).get("phone"):
+        await tg_send_text(
+            chat_id,
+            THERMOBOX_TEXT,
+            reply_markup={"inline_keyboard": [[{"text": "🛒 Выбрать точку выдачи", "url": THERMOBOX_URL}]]},
         )
         return
 
@@ -4754,7 +4972,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         await tg_send_text(chat_id, build_bot_users_admin_text(), reply_markup=kb_bot_users_menu())
         return
 
-    if is_adm and norm_cmd in ("нажали подключиться", "нажали уже курьер", "нажали статистику", "нажали доход", "нажали корректировки", "нажали бонус", "нажали обучение", "нажали чат", "нажали помощь", "активные 24 часа", "все пользователи", "неактивные 7+ дней", "неактивные 30+ дней", "получили рассылку", "заблокировали бота", "последние действия", "история рассылок"):
+    if is_adm and norm_cmd in ("нажали подключиться", "нажали уже курьер", "нажали статистику", "нажали доход", "нажали корректировки", "нажали бонус", "нажали обучение", "нажали чат", "нажали помощь", "нажали термокороб", "активные 24 часа", "все пользователи", "неактивные 7+ дней", "неактивные 30+ дней", "получили рассылку", "заблокировали бота", "последние действия", "история рассылок"):
         segment = {
             "нажали подключиться": "connect",
             "нажали уже курьер": "already",
@@ -4765,6 +4983,7 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             "нажали обучение": "training",
             "нажали чат": "chat",
             "нажали помощь": "help",
+            "нажали термокороб": "thermobox",
             "активные 24 часа": "active",
             "все пользователи": "all",
             "неактивные 7+ дней": "inactive7",
@@ -5447,7 +5666,12 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
             )
             return
 
-    await send_start_menu(chat_id, first_name=first_name)
+    await tg_send_text(
+        chat_id,
+        "Я пока понимаю только кнопки меню 🙂 Выбери нужный раздел ниже.\n"
+        "Если вопрос не по кнопкам, нажми «❓ Помощь» — там контакты поддержки.",
+        reply_markup=kb_start_menu(is_admin=is_adm),
+    )
 
 
 async def _fetch_contact_phones_from_amocrm(
