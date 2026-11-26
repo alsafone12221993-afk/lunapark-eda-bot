@@ -6547,7 +6547,9 @@ def create_app() -> web.Application:
     app.router.add_get("/health", handle_health)
     app.router.add_post("/", handle_amocrm_webhook)
     app.router.add_post("/webhook/telegram", handle_tg_webhook)
-    app.router.add_post("/webhook/wazzup", handle_wazzup_webhook)
+    # Регистрируем Wazzup webhook только при явно включённой интеграции.
+    if WAZZUP_ENABLED:
+        app.router.add_post("/webhook/wazzup", handle_wazzup_webhook)
     app.router.add_post("/webhook/amocrm", handle_amocrm_webhook)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
