@@ -955,7 +955,11 @@ async def answer_simple_question_with_ai(user_text: str, chat_id: int | str | No
     low = (user_text or "").strip().lower()
     if not low or len(low) < 3:
         return None
-    personal_stats_question = bool(re.search(r"(мой|мои|у меня|мне|я )?.{0,35}(заработ|доход|заказ|километр|статистик|баланс|выплат|начисл|удерж|списан|корректиров)|сколько\s+(я|мне)\s*(заработал|получил|сделал|выполнил|начислили)?", low))
+    personal_stats_question = bool(
+        re.search(r"\b(?:мой|мои|мне|у меня)\b.{0,45}\b(?:заработ|доход|заказ|километр|статистик|баланс|выплат|начисл|удерж|списан|корректиров)", low)
+        or re.search(r"\b(?:заработ|доход|заказ|километр|статистик|баланс|выплат|начисл|удерж|списан|корректиров)\b.{0,35}\b(?:у меня|мне|мой|мои)\b", low)
+        or re.search(r"\bсколько\s+(?:я|мне)\b.{0,30}\b(?:заработ|получ|сдел|выполн|заказ|начисл)", low)
+    )
     safe_text = re.sub(r"\d{5,}", "…", user_text.strip())[:400]
     faq = None if personal_stats_question or AI_PROVIDER == "yandex" else _quick_faq_answer(low)
     if faq:
