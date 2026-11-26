@@ -4280,70 +4280,97 @@ def pop_pending_demand(city_name: str | None = None) -> dict[str, Any] | None:
     return val
 
 
-async def notify_superadmin_about_demand(city_name: str, rate_rub_hour: int = DEMAND_RATE_RUB_PER_HOUR) -> None:
+async def collect_demand_snapshot(force_refresh: bool = True) -> tuple[dict[str, int], list[str]]:
+    """Считает незавершённые заказы за последний час отдельно по СПб и Москве."""
+    now = datetime.now(timezone.utc)
+    hour_ago = now - timedelta(hours=1)
+    city_recent_count: dict[str, int] = defaultdict(int)
+    errors: list[str] = []
+    successful_parks = 0
+
+    async with aiohttp.ClientSession() as session:
+        for park in PARKS_CONFIG:
+            try:
+                drivers = await get_cached_drivers(session, park, force_refresh=force_refresh)
+                city_by_driver: dict[str, str] = {}
+                for item in drivers:
+                    if not isinstance(item, dict):
+                        continue
+                    prof = item.get("driver_profile") or {}
+                    did = str(prof.get("id") or "").strip()
+                    city = _normalize_city_key(str(prof.get("city") or ""))
+                    if did and city in ("Санкт-Петербург", "Москва"):
+                        city_by_driver[did] = city
+
+                orders = await _fetch_park_orders_window(
+                    session, park, hour_ago, now, date_field="booked_at", completed_only=False
+                )
+                successful_parks += 1
+                seen_ids: set[str] = set()
+                for order in orders:
+                    if not isinstance(order, dict):
+                        continue
+                    order_id = str(order.get("id") or order.get("order_id") or "").strip()
+                    if order_id and order_id in seen_ids:
+                        continue
+                    if order_id:
+                        seen_ids.add(order_id)
+                    if _is_completed_order_status(str(order.get("status") or "")):
+                        continue
+
+                    prof = order.get("driver_profile") or {}
+                    raw_city = order.get("city") or order.get("city_name") or prof.get("city")
+                    city = _normalize_city_key(str(raw_city or ""))
+                    if city not in ("Санкт-Петербург", "Москва"):
+                        did = str(prof.get("id") or order.get("driver_id") or "").strip()
+                        city = city_by_driver.get(did, "")
+                    if city in ("Санкт-Петербург", "Москва"):
+                        city_recent_count[city] += 1
+            except Exception as exc:
+                message = f"{park.get('name', 'Парк')}: {exc}"
+                errors.append(message)
+                logger.warning("Проверка спроса в парке %s не удалась: %s", park.get("name"), exc)
+
+    if successful_parks == 0 and not errors:
+        errors.append("Не настроены парки для проверки.")
+    return dict(city_recent_count), errors
+
+
+async def notify_superadmin_about_demand(city_name: str, rate_rub_hour: int = DEMAND_RATE_RUB_PER_HOUR) -> bool:
     clean_city = _normalize_city_key(city_name) or city_name.strip()
     city_key = clean_city.lower()
     pending = _read_json(PENDING_DEMANDS_FILE, {})
     if isinstance(pending, dict):
         existing = pending.get(city_key)
         if isinstance(existing, dict) and time.time() - float(existing.get("created_at") or 0) < 3600:
-            return
+            return False
     recipients = find_users_by_city(clean_city)
     if not recipients:
         logger.info("Повышенный спрос %s: нет пользователей с сохранённым городом; уведомление не отправлено", clean_city)
-        return
+        return False
     save_pending_demand(clean_city, rate_rub_hour)
     preview = (
-        f"🔥 ПОВЫШЕННЫЙ СПРОС\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 Город: {clean_city}\n"
-        f"💰 Ставка: от {rate_rub_hour} ₽/час\n"
-        f"👥 Получателей: {len(recipients)} курьеров\n"
-        f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"Предлагаемый текст уведомления:\n"
-        f"«🔥 В {clean_city} сейчас повышенный спрос на курьеров. Заказы — от {rate_rub_hour} ₽/час. Выходи на линию!»\n\n"
+        f"🔥 ПОВЫШЕННЫЙ СПРОС\\n"
+        f"━━━━━━━━━━━━━━━━━━\\n"
+        f"📍 Город: {clean_city}\\n"
+        f"💰 Ставка: от {rate_rub_hour} ₽/час\\n"
+        f"👥 Получателей: {len(recipients)} курьеров\\n"
+        f"━━━━━━━━━━━━━━━━━━\\n\\n"
+        f"Предлагаемый текст уведомления:\\n"
+        f"«🔥 В {clean_city} сейчас повышенный спрос на курьеров. Заказы — от {rate_rub_hour} ₽/час. Выходи на линию!»\\n\\n"
         f"Отправка НЕ начнётся без твоего подтверждения."
     )
     await tg_send_text(SUPERADMIN_ID, preview, reply_markup=kb_demand_confirm(city_key))
+    return True
 
 
 async def demand_monitor_worker() -> None:
     await asyncio.sleep(25)
     while True:
         try:
-            now = datetime.now(timezone.utc)
-            hour_ago = now - timedelta(hours=1)
-            city_recent_count: dict[str, int] = defaultdict(int)
-            async with aiohttp.ClientSession() as session:
-                for park in PARKS_CONFIG:
-                    try:
-                        drivers = await get_cached_drivers(session, park, force_refresh=False)
-                        city_by_driver: dict[str, str] = {}
-                        for item in drivers:
-                            if not isinstance(item, dict):
-                                continue
-                            prof = item.get("driver_profile") or {}
-                            did = str(prof.get("id") or "").strip()
-                            city = _normalize_city_key(str(prof.get("city") or ""))
-                            if did and city in ("Санкт-Петербург", "Москва"):
-                                city_by_driver[did] = city
-                        if not city_by_driver:
-                            continue
-                        orders = await _fetch_park_orders_window(
-                            session, park, hour_ago, now, date_field="booked_at", completed_only=False
-                        )
-                        for order in orders:
-                            if not isinstance(order, dict):
-                                continue
-                            if _is_completed_order_status(str(order.get("status") or "")):
-                                continue
-                            prof = order.get("driver_profile") or {}
-                            did = str(prof.get("id") or order.get("driver_id") or "").strip()
-                            city = city_by_driver.get(did)
-                            if city:
-                                city_recent_count[city] += 1
-                    except Exception as exc:
-                        logger.warning("Проверка спроса в парке %s не удалась: %s", park.get("name"), exc)
+            city_recent_count, errors = await collect_demand_snapshot(force_refresh=False)
+            if errors:
+                logger.warning("Проверка спроса завершилась с ошибками: %s", "; ".join(errors))
             for city_name in ("Санкт-Петербург", "Москва"):
                 if city_recent_count.get(city_name, 0) >= 3:
                     await notify_superadmin_about_demand(city_name, DEMAND_RATE_RUB_PER_HOUR)
@@ -5389,9 +5416,44 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
         return
 
     if is_super and norm_cmd in ("проверить спрос", "спрос"):
-        await notify_superadmin_about_demand("Санкт-Петербург", DEMAND_RATE_RUB_PER_HOUR)
-        await notify_superadmin_about_demand("Москва", DEMAND_RATE_RUB_PER_HOUR)
-        await send_ephemeral_text(chat_id, "Запросы на подтверждение спроса отправлены тебе.", reply_markup=kb_admin_menu(True), ttl_sec=12)
+        await send_ephemeral_text(
+            chat_id,
+            "⏳ Проверяю активные заказы за последний час по СПб и Москве…",
+            reply_markup=kb_admin_menu(True),
+            ttl_sec=30,
+        )
+        try:
+            demand_counts, demand_errors = await collect_demand_snapshot(force_refresh=True)
+            report = ["📊 РЕЗУЛЬТАТ ПРОВЕРКИ СПРОСА", "Период: последний час", ""]
+            for city_name in ("Санкт-Петербург", "Москва"):
+                count = int(demand_counts.get(city_name, 0))
+                report.append(f"{'🔥' if count >= 3 else '▫️'} {city_name}: {count} активных заказов")
+                if count >= 3:
+                    sent = await notify_superadmin_about_demand(city_name, DEMAND_RATE_RUB_PER_HOUR)
+                    if sent:
+                        report.append("   Запрос на согласование рассылки отправлен.")
+                    else:
+                        recipients = len(find_users_by_city(city_name))
+                        report.append(
+                            "   Рассылка уже ожидает решения (повторный запрос не создан)."
+                            if recipients else
+                            "   Нет получателей с сохранённым городом — рассылка недоступна."
+                        )
+                else:
+                    report.append("   Порог повышенного спроса не достигнут (нужно от 3 заказов).")
+            if demand_errors:
+                report.extend(["", "⚠️ Ошибки при обращении к парку:"])
+                report.extend(f"• {err[:250]}" for err in demand_errors)
+            else:
+                report.extend(["", "✅ Данные Fleet API получены."])
+            await tg_send_text(chat_id, "\\n".join(report), reply_markup=kb_admin_menu(True))
+        except Exception as exc:
+            logger.exception("Ручная проверка спроса завершилась ошибкой")
+            await tg_send_text(
+                chat_id,
+                f"❌ Не удалось проверить спрос через Fleet API.\\n{str(exc)[:500]}",
+                reply_markup=kb_admin_menu(True),
+            )
         return
 
     if is_super and norm_cmd in ("админы", "список админов"):
